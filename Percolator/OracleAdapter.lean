@@ -512,6 +512,13 @@ def handleInitAdapter (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen adp) >= AdpOff.size) Err.accountDataTooSmall
   SolanaM.require ((← loadU32 (AccountView.dataPtr adp) 0) == 0) Err.accountAlreadyInitialized
 
+  -- The market must already exist, and only its admin may choose the feed and adapter admin.
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (AccountView.keyPtr percProg)) Err.illegalOwner
+  SolanaM.require ((← AccountView.dataLen mkt) >= MktOff.size) Err.accountDataTooSmall
+  let mData := AccountView.dataPtr mkt
+  SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
+  SolanaM.require (← pubkeyEq (AccountView.keyPtr admin) (mData + MktOff.marketAdmin)) PErr.unauthorized
+
   let pdaBump     ← loadU8  ix.ptr 1
   let feedType    ← loadU8  ix.ptr 2
   let qFeedType   ← loadU8  ix.ptr 3
