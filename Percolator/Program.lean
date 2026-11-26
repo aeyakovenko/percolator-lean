@@ -671,12 +671,13 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
   else
     requireWritable receipt
     requireKeyEq (AccountView.ownerPtr receipt) progId Err.illegalOwner
-    SolanaM.require ((← AccountView.dataLen receipt) >= InsOff.size) Err.accountDataTooSmall
+    SolanaM.require ((← AccountView.dataLen receipt) == InsOff.size) Err.accountDataTooSmall
     let rData := AccountView.dataPtr receipt
     let mid ← loadU64 mData MktOff.marketId
     if (← loadU32 rData InsOff.magic) == 0 then
       storeU32 rData InsOff.magic MAGIC_INSURANCE
       storeU64 rData InsOff.marketId mid
+      storeU64 rData InsOff.shares 0
       pubkeyCopy (rData + InsOff.owner)  (AccountView.keyPtr lp)
       pubkeyCopy (rData + InsOff.market) (AccountView.keyPtr mkt)
     else
@@ -724,6 +725,7 @@ def handleWithdrawInsurance (input : Ptr) : SolanaM Unit := do
   let curSh ← loadU64 rData InsOff.shares
   SolanaM.require (curSh >= burnShares) PErr.insufficientFunds
   let totSh ← loadU64 mData MktOff.totalInsShares
+  SolanaM.require (burnShares <= totSh) PErr.insufficientFunds
   let ins   ← loadU64 mData MktOff.insurance
   let payout ← mulDiv64 burnShares ins totSh
 
