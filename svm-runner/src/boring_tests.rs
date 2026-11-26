@@ -1930,7 +1930,31 @@ pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
     assert_eq!(read_u8(&e.svm, &frz_dex, 7), 1, "DexOff.allowFreeze must record 1 immutably");
 }
 
-/// Runs all 17 boring everyday exchange + security regression LiteSVM tests as Suite 12.
+/// 18. Round-3 regression: atomic auto-netted `Trade(mode=4)` (`tradeNettedCore`).
+///     (a) mode=4 from flat opens like mode 0; (b) mutually offsetting positions net-close
+///     atomically (closeB=closeS>0 -> mode-1 close), restoring OI to 0 with exact conservation.
+pub fn test_round3_mode4_atomic_netting(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 400);
+    let alice = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let bob   = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+
+    // (a) mode=4 from flat == plain open: Alice long 1 vs Bob short 1
+    e.trade(btc, &alice, &bob, 4, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 1 * POS_SCALE, "mode4 open: OI must be 1");
+    assert_eq!(read_u8(&e.svm, &alice.pfl, 4), 1, "alice holds 1 leg after mode4 open");
+    e.check("r3-mode4-open");
+
+    // (b) mutually offsetting positions net-close atomically. Pass the SHORT holder first
+    //     (buyer) and the LONG holder second (seller) so closeB = closeS = 1 under tradeNettedCore.
+    e.trade(btc, &bob, &alice, 4, 1 * POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0, "mode4 netting close: OI must return to 0");
+    assert_eq!(read_u8(&e.svm, &alice.pfl, 4), 0, "alice must be flat after netting");
+    assert_eq!(read_u8(&e.svm, &bob.pfl, 4), 0, "bob must be flat after netting");
+    e.check("r3-mode4-netted");
+}
+
+/// Runs all boring everyday exchange + security regression LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -1949,6 +1973,7 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_security_revival_and_dirty_init_regressions(elf);
     test_audited_security_regressions(elf, matcher_elf);
     test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf);
+    test_round3_mode4_atomic_netting(elf);
     println!("[PASS] Suite 12: 17 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
     println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
     println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool, Self-Transfer,");
@@ -1985,4 +2010,5 @@ mod tests {
     #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
     #[test] fn boring_16_audited_security_regressions() { let (e, m) = load_elfs(); test_audited_security_regressions(&e, &m); }
     #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
+    #[test] fn boring_18_round3_mode4_atomic_netting() { let (e, _) = load_elfs(); test_round3_mode4_atomic_netting(&e); }
 }
