@@ -695,6 +695,11 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
     addU64At dData DexOff.vaultBalance   amount
     addU64At dData DexOff.totalInsurance amount
     addU64At mData MktOff.insurance      amount
+    -- Shareless insurance (donation or fee accrual while no receipts exist) is not
+    -- redeemable. Lock it behind shares no receipt holds, or this first mint owns
+    -- 100% of the pool and can withdraw it.
+    if totSh == 0 && ins > 0 then
+      addU64At mData MktOff.totalInsShares ins
     addU64At mData MktOff.totalInsShares minted
     addU64At rData InsOff.shares         minted
 
