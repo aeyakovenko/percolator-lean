@@ -478,6 +478,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 dData DexOff.nextMarketId (← checkedAdd64 mid 1)
 
   let mData := AccountView.dataPtr mkt
+  SolanaM.require ((← loadU64 mData MktOff.totalInsShares) == 0) PErr.nonzeroState
   storeU32 mData MktOff.magic MAGIC_MARKET
   storeU8  mData MktOff.status STATUS_ACTIVE
   storeU64 mData MktOff.marketId mid
@@ -589,6 +590,11 @@ def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   storeU64 fData PflOff.episode 1
   pubkeyCopy (fData + PflOff.dex)   (AccountView.keyPtr dex)
   pubkeyCopy (fData + PflOff.owner) (AccountView.keyPtr owner)
+  -- Closed-account revival leaves marketAdmin (off 80) on capital/totalMm/totalIm.
+  storeU64 fData PflOff.capital 0
+  storeU64 fData PflOff.totalMm 0
+  storeU64 fData PflOff.totalIm 0
+  storeU64 fData PflOff.totalReservedMm 0
 
 def handleDepositCollateral (input : Ptr) : SolanaM Unit := do
   let (dex, pfl, owner, ownerTok, mint, vaultPda, tokProg, ix, progId) ← parse7 input
@@ -679,6 +685,7 @@ def handleDepositInsurance (input : Ptr) : SolanaM Unit := do
       storeU64 rData InsOff.marketId mid
       pubkeyCopy (rData + InsOff.owner)  (AccountView.keyPtr lp)
       pubkeyCopy (rData + InsOff.market) (AccountView.keyPtr mkt)
+      storeU64 rData InsOff.shares 0
     else
       SolanaM.require ((← loadU32 rData InsOff.magic) == MAGIC_INSURANCE) PErr.invalidMagic
       requireKeyEq (AccountView.keyPtr lp)  (rData + InsOff.owner)  PErr.ownerMismatch
