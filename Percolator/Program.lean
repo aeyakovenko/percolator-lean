@@ -445,15 +445,88 @@ def realizeWinnerPnl (dData mData fData : Ptr) (posPnl : UInt64) (forceHaircut :
       return posPnl
 
 /-- Uncollectible bad-debt write-off (generalized across ALL 5 settlement callers):
-    Any portion of `sf` already fronted out of `I_m` (`insFronted`) is now a realized
-    bad-debt loss, NOT a collectible receivable — writing it off prevents both LP NAV
-    overstatement (`I_m + insFronted`) AND double-drawing `I_m` in `handleLiquidate`! -/
-def writeOffShortfall (mktData : Ptr) (sf : UInt64) : SolanaM UInt64 := do
+    - When `allowBankrupt = false` (non-liquidation callers `RefreshLeg`, `Trade`, `TradeWithMatcher`),
+      ANY nonzero bad debt (`sf > 0`) is rejected with `PErr.insufficientMargin` BEFORE touching
+      `Mkt.insFronted` or advancing `entryK` so bad debt can NEVER bypass `handleLiquidate` (`#109`).
+    - When `allowBankrupt = true` (`Liquidate`, `ClearDeadLeg`, `ForceClosePair`), any portion of `sf`
+      already fronted out of `I_m` (`insFronted`) is written off so LP NAV is never overstated and
+      `I_m` is never double-drawn! -/
+def writeOffShortfall (mktData : Ptr) (sf : UInt64) (allowBankrupt : Bool := true) : SolanaM UInt64 := do
   if sf == 0 then return 0
+  if !allowBankrupt then SolanaM.fail PErr.insufficientMargin
   let fronted ← loadU64 mktData MktOff.insFronted
   let wo := if sf < fronted then sf else fronted
   if wo > 0 then subU64At mktData MktOff.insFronted wo
   return sf - wo
+
+/-- Pure high 64 bits of unsigned 64×64 multiplication (`⌊a * b / 2^64⌋`, zero stack/mem). -/
+@[inline] def mulHi64 (a b : UInt64) : UInt64 :=
+  let m : UInt64 := 0xFFFFFFFF
+  let aLo := a &&& m; let aHi := a >>> 32
+  let bLo := b &&& m; let bHi := b >>> 32
+  let p0 := aLo * bLo; let p1 := aLo * bHi; let p2 := aHi * bLo; let p3 := aHi * bHi
+  let mid := (p0 >>> 32) + (p1 &&& m) + (p2 &&& m)
+  p3 + (p1 >>> 32) + (p2 >>> 32) + (mid >>> 32)
+
+/-- Overflow-immune saturating `⌊a * b / denom⌋` (`denom > 0`): returns `u64::MAX` on `≥ 2^64`,
+    preventing self-made market overflow DoS (`#110`) in `settleAndRefreshLeg`. -/
+def mulDiv64Sat (a b denom : UInt64) : SolanaM UInt64 := do
+  if mulHi64 a b >= denom then return 0xFFFFFFFFFFFFFFFF
+  mulDiv64 a b denom
+
+/-- Overflow-immune saturating `⌈a * b / denom⌉` (`denom > 0`): returns `u64::MAX` on `≥ 2^64`,
+    preventing self-made market overflow DoS (`#110`) in `settleAndRefreshLeg`. -/
+def mulDiv64CeilSat (a b denom : UInt64) : SolanaM UInt64 := do
+  if mulHi64 a b >= denom then return 0xFFFFFFFFFFFFFFFF
+  let q ← mulDiv64 a b denom
+  if q == 0xFFFFFFFFFFFFFFFF then return 0xFFFFFFFFFFFFFFFF
+  if (a ||| b) <= 0xFFFFFFFF then
+    if (a * b) % denom == 0 then return q else return q + 1
+  else
+    if q * denom == a * b then return q else return q + 1
+
+/-- Saturating gain cap so `posPnl + gain ≤ u64::MAX` and `totalPosPnl + gain ≤ u64::MAX`
+    (prevents winning-leg overflow DoS on self-made markets, `#110`). -/
+@[inline] def satAddGain (rawGain posPnl curTotPnl : UInt64) : UInt64 :=
+  let roomPos := 0xFFFFFFFFFFFFFFFF - posPnl
+  let roomTot := 0xFFFFFFFFFFFFFFFF - curTotPnl
+  let room := if roomPos < roomTot then roomPos else roomTot
+  if rawGain < room then rawGain else room
+
+/-- Saturating gain credit into `MktOff.totalPosPnl` and `posPnl` (`#110` overflow-immune). -/
+def creditSatGain (mktData : Ptr) (posPnl rawGain : UInt64) : SolanaM UInt64 := do
+  let curTotPnl ← loadU64 mktData MktOff.totalPosPnl
+  let gain := satAddGain rawGain posPnl curTotPnl
+  storeU64 mktData MktOff.totalPosPnl (curTotPnl + gain)
+  return posPnl + gain
+
+/-- Per-leg `lockedMm` firewall loss settlement + `writeOffShortfall`:
+    1. Burns `lp.posPnl` first,
+    2. Debits shared `freeCapital` (`PflOff.capital`) second,
+    3. Debits ONLY this leg's isolated `lp.lockedMm` third — **NEVER** any other leg's `lockedMm`!
+    Returns `(posPnl', shortfall)`. -/
+def settleFirewallLoss (dexData mktData pflData lp : Ptr) (posPnl loss : UInt64)
+    (allowBankrupt : Bool) : SolanaM (UInt64 × UInt64) := do
+  let pnlBurned := if loss < posPnl then loss else posPnl
+  let posPnl1 := posPnl - pnlBurned
+  if pnlBurned > 0 then subU64At mktData MktOff.totalPosPnl pnlBurned
+  let rem1 := loss - pnlBurned
+  let freeCap ← loadU64 pflData PflOff.capital
+  let freeDeb := if rem1 < freeCap then rem1 else freeCap
+  if freeDeb > 0 then
+    storeU64 pflData PflOff.capital (freeCap - freeDeb)
+  let rem2 := rem1 - freeDeb
+  let legLock ← loadU64 lp LegOff.lockedMm
+  let lockDeb := if rem2 < legLock then rem2 else legLock
+  if lockDeb > 0 then
+    storeU64 lp LegOff.lockedMm (legLock - lockDeb)
+    subU64At pflData PflOff.totalLockedMm lockDeb
+  let capDeb := freeDeb + lockDeb
+  if capDeb > 0 then
+    subU64At dexData DexOff.totalCapital capDeb
+    creditMarketFromLoser dexData mktData capDeb
+  let sf ← writeOffShortfall mktData (rem2 - lockDeb) allowBankrupt
+  return (posPnl1, sf)
 
 /-- Settle `entryK → kSide` with the per-leg `lockedMm` firewall:
     1. Burns `lp.posPnl` first,
@@ -465,7 +538,7 @@ def writeOffShortfall (mktData : Ptr) (sf : UInt64) : SolanaM UInt64 := do
     Repays `Mkt.insFronted` senior, writes off uncollectible fronted bad debt, realizes backed
     (or `I_m`-fronted) `posPnl` into `freeCapital`, and syncs margins. -/
 def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt64)
-    (forceHaircut : Bool) : SolanaM UInt64 := do
+    (forceHaircut : Bool) (allowBankrupt : Bool := true) : SolanaM UInt64 := do
   let lp := legPtrAt pflData slotIdx
   let side ← loadU8 lp LegOff.side
   let rawB ← loadU64 lp LegOff.rawBasis
@@ -476,31 +549,13 @@ def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt6
     let kSide ← loadU64 mktData (if side == SIDE_LONG then MktOff.kLong else MktOff.kShort)
     let entryK ← loadU64 lp LegOff.entryK
     if kSide > entryK then
-      let gain ← mulDiv64 rawB (kSide - entryK) POS_SCALE
-      posPnl ← checkedAdd64 posPnl gain
-      addU64At mktData MktOff.totalPosPnl gain
+      let rawGain ← mulDiv64Sat rawB (kSide - entryK) POS_SCALE
+      posPnl ← creditSatGain mktData posPnl rawGain
     else if entryK > kSide then
-      let loss ← mulDiv64Ceil rawB (entryK - kSide) POS_SCALE
-      let pnlBurned := if loss < posPnl then loss else posPnl
-      posPnl := posPnl - pnlBurned
-      if pnlBurned > 0 then subU64At mktData MktOff.totalPosPnl pnlBurned
-      let rem1 := loss - pnlBurned
-      -- Per-leg `lockedMm` firewall: debit `freeCapital` first, then ONLY this leg's `lockedMm`!
-      let freeCap ← loadU64 pflData PflOff.capital
-      let freeDeb := if rem1 < freeCap then rem1 else freeCap
-      if freeDeb > 0 then
-        storeU64 pflData PflOff.capital (freeCap - freeDeb)
-      let rem2 := rem1 - freeDeb
-      let legLock ← loadU64 lp LegOff.lockedMm
-      let lockDeb := if rem2 < legLock then rem2 else legLock
-      if lockDeb > 0 then
-        storeU64 lp LegOff.lockedMm (legLock - lockDeb)
-        subU64At pflData PflOff.totalLockedMm lockDeb
-      let capDeb := freeDeb + lockDeb
-      if capDeb > 0 then
-        subU64At dexData DexOff.totalCapital capDeb
-        creditMarketFromLoser dexData mktData capDeb
-      shortfall ← writeOffShortfall mktData (rem2 - lockDeb)
+      let loss ← mulDiv64CeilSat rawB (entryK - kSide) POS_SCALE
+      let (pp', sf') ← settleFirewallLoss dexData mktData pflData lp posPnl loss allowBankrupt
+      posPnl := pp'
+      shortfall := sf'
     storeU64 lp LegOff.entryK kSide
 
   posPnl ← realizeWinnerPnl dexData mktData pflData posPnl forceHaircut
@@ -630,6 +685,8 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← checkedAdd64 k5MoveBps liqAtP5) <= mmBps &&
                    (← checkedAdd64 mmBps maxMoveBps) <= imBps) PErr.invalidParams
   SolanaM.require (tradeFeeBps <= 1000 && maxOi > 0 && maxOi <= MAX_OI) PErr.invalidParams
+  let initNot ← mulDiv64Ceil maxOi initPrice POS_SCALE
+  SolanaM.require (initNot <= MAX_MKT_NOTIONAL) PErr.invalidParams
 
   let createFee ← loadU64 dData DexOff.createFee
   if createFee > 0 then
@@ -730,6 +787,10 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
   -- `∑ gain ≤ ∑ loss` for EVERY asymmetric post-ADL ratio `(oi, rawL, rawS)` and EVERY `diff`!
   let oiL  ← loadU64 mData MktOff.oiLong
   let oiS  ← loadU64 mData MktOff.oiShort
+  let maxOiCur := if oiL > oiS then oiL else oiS
+  if maxOiCur > 0 then
+    let curNot ← mulDiv64Ceil maxOiCur newPrice POS_SCALE
+    SolanaM.require (curNot <= MAX_MKT_NOTIONAL) PErr.oiLimitExceeded
   let rL   ← loadU64 mData MktOff.rawBasisLong
   let rS   ← loadU64 mData MktOff.rawBasisShort
   let adlL ← loadU64 mData MktOff.adlLong
@@ -990,7 +1051,7 @@ def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
     requireSigner owner
     requireKeyEq (AccountView.keyPtr owner) (fData + PflOff.owner) PErr.ownerMismatch
     SolanaM.require ((← loadU64 (legPtrAt fData slotIdx) LegOff.rawBasis) == 0) PErr.nonzeroState
-  let _ ← settleAndRefreshLeg dData mData fData slotIdx curSlot forceHaircut
+  let _ ← settleAndRefreshLeg dData mData fData slotIdx curSlot forceHaircut false
   freeLegIfEmpty fData slotIdx
 
 /-- Apply optional bounded `execPrice` spread transfer directly between Long & Short `capital`.
@@ -1057,8 +1118,8 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     SolanaM.require (sL == SIDE_FLAT || sL == SIDE_LONG)  PErr.invalidSide
     SolanaM.require (sS == SIDE_FLAT || sS == SIDE_SHORT) PErr.invalidSide
 
-    let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
-    let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false
+    let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false false
+    let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false false
     applyExecSpread mData fLData fSData qty execPrice
 
     let oiL ← loadU64 mData MktOff.oiLong
@@ -1124,8 +1185,8 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     requireKeyEq mktKeyPtr (lpS + LegOff.market) PErr.marketMismatch
     SolanaM.require ((← loadU8 lpL LegOff.side) == SIDE_LONG && (← loadU8 lpS LegOff.side) == SIDE_SHORT) PErr.invalidSide
 
-    let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false
-    let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false
+    let _ ← settleAndRefreshLeg dData mData fLData slotL curSlot false false
+    let _ ← settleAndRefreshLeg dData mData fSData slotS curSlot false false
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
@@ -1202,8 +1263,8 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     let sBuy ← loadU8 lpBuy LegOff.side
     SolanaM.require (sBuy == SIDE_FLAT || sBuy == targetSide) PErr.invalidSide
 
-    let _ ← settleAndRefreshLeg dData mData fLData slotSell curSlot false
-    let _ ← settleAndRefreshLeg dData mData fSData slotBuy  curSlot false
+    let _ ← settleAndRefreshLeg dData mData fLData slotSell curSlot false false
+    let _ ← settleAndRefreshLeg dData mData fSData slotBuy  curSlot false false
 
     let rSell ← loadU64 lpSell LegOff.rawBasis
     let rawXfer ← proportionalRawRedU64 qty rSell rMktSide oiSide
@@ -1405,8 +1466,11 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   let rawClose := if shortfall > 0 || (freeCap == 0 && legLock == 0) || reqQty == 0 || reqQty >= rawB then rawB else reqQty
   let remRaw   := rawB - rawClose
   -- A1 Fix: require ALL open legs on victim to be refreshed in `curSlot` BEFORE evaluating
-  -- per-leg solvency, preventing selective liquidation of a hedged cross-margin spread!
-  checkAllLegsFreshLoop fData curSlot 0 false
+  -- per-leg solvency on solvent portfolios, preventing selective liquidation of a hedged spread;
+  -- skip ONLY when this leg is already bankrupt (`shortfall > 0 || (freeCap == 0 && legLock == 0)`)
+  -- so two bankrupt legs or an overflowing self-made market leg can NEVER deadlock liquidation!
+  if shortfall == 0 && (freeCap > 0 || legLock > 0) then
+    checkAllLegsFreshLoop fData curSlot 0 false
 
   let availCap ← checkedAdd64 freeCap legLock
   let eq ← checkedAdd64 availCap posPnl
@@ -1427,6 +1491,18 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
       let g := if deficit > feeFloor then deficit else feeFloor
       if g < maxFee then g else maxFee
   let liqFee := if targetFee < availCap then targetFee else availCap
+
+  -- Fix #107: Enforce post-fee solvency & exact `minMm` floor on ANY partial liquidation (`remRaw > 0`):
+  -- a partial liquidation must NEVER leave `remRaw > 0` under-margined (`postEq < remMm`) or zero-backed (`postAvail == 0`)!
+  if remRaw > 0 then
+    let minMm  ← loadU64 mData MktOff.minMm
+    let mmBps  ← loadU64 mData MktOff.mmBps
+    let remEff ← mulDiv64 remRaw adlSide ADL_ONE
+    let remMm  ← computeMarginWithFloor remEff markP mmBps minMm
+    let postAvail := availCap - liqFee
+    let postEq ← checkedAdd64 postAvail posPnl
+    SolanaM.require (remEff > 0 && postAvail > 0 && postEq >= remMm && remMm >= minMm) PErr.invalidParams
+
   if liqFee > 0 then
     let feeFree := if liqFee < freeCap then liqFee else freeCap
     let feeLock := liqFee - feeFree
@@ -1455,13 +1531,6 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
       addU64At mData MktOff.realizedPool   insDraw
       addU64At dData DexOff.totalResidual  insDraw
 
-  -- Prevent partial liquidation from leaving a dust leg below `minMm`!
-  if remRaw > 0 then
-    let minMm ← loadU64 mData MktOff.minMm
-    let remEff ← mulDiv64 remRaw adlSide ADL_ONE
-    let remNot ← mulDiv64Ceil remEff markP POS_SCALE
-    SolanaM.require (remNot >= minMm) PErr.invalidParams
-
   if mode == 1 then
     -- Tier 1/2 Transparent HLP / Counterparty Takeover (**ZERO ADL!**)
     SolanaM.require (n >= 9) Err.notEnoughAccountKeys
@@ -1483,7 +1552,7 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
     let liqLp := legPtrAt lData liqSlot
     let liqSide ← loadU8 liqLp LegOff.side
     SolanaM.require (liqSide == SIDE_FLAT || liqSide == side) PErr.invalidSide
-    let _ ← settleAndRefreshLeg dData mData lData liqSlot curSlot false
+    let _ ← settleAndRefreshLeg dData mData lData liqSlot curSlot false false
     if liqSide == SIDE_FLAT then
       storeU8  liqLp LegOff.side side
       storeU64 liqLp LegOff.entryK (← loadU64 mData (if side == SIDE_LONG then MktOff.kLong else MktOff.kShort))

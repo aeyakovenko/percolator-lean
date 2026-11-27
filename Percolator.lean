@@ -5,6 +5,7 @@ import Percolator.TraceProofs
 import Percolator.ThreatModel
 import Percolator.Program
 import Percolator.Matcher
+import Percolator.LimitMatcher
 import Percolator.OracleAdapter
 import Percolator.RewardModule
 import Percolator.HlpVault

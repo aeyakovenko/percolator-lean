@@ -457,10 +457,10 @@ theorem handleRefreshLeg_end_to_end_stock_and_firewall
           requireKeyEq (AccountView.keyPtr owner) (AccountView.dataPtr pfl + PflOff.owner) PErr.ownerMismatch
           let __do_lift ← loadU64 (legPtrAt (AccountView.dataPtr pfl) slotIdx) LegOff.rawBasis
           SolanaM.require (__do_lift == 0) PErr.nonzeroState
-          let _ ← settleAndRefreshLeg (AccountView.dataPtr dex) (AccountView.dataPtr mkt) (AccountView.dataPtr pfl) slotIdx curSlot fh
+          let _ ← settleAndRefreshLeg (AccountView.dataPtr dex) (AccountView.dataPtr mkt) (AccountView.dataPtr pfl) slotIdx curSlot fh false
           freeLegIfEmpty (AccountView.dataPtr pfl) slotIdx
         else do
-          let _ ← settleAndRefreshLeg (AccountView.dataPtr dex) (AccountView.dataPtr mkt) (AccountView.dataPtr pfl) slotIdx curSlot fh
+          let _ ← settleAndRefreshLeg (AccountView.dataPtr dex) (AccountView.dataPtr mkt) (AccountView.dataPtr pfl) slotIdx curSlot fh false
           freeLegIfEmpty (AccountView.dataPtr pfl) slotIdx) s₁₈ = .ok () s' →
       fh = true →
       regionValid (AccountView.dataPtr pfl) PflOff.size →

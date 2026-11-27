@@ -18,6 +18,7 @@ def BPS_DEN          : UInt64 := 10_000             -- basis points denominator
 def K_ZERO           : UInt64 := 0x4000000000000000 -- 2^62 unbiased zero for cumulative K_side
 def MAX_PRICE        : UInt64 := 1_000_000_000_000      -- $1,000,000 at E6
 def MAX_OI           : UInt64 := 10_000_000_000_000     -- 10,000,000 units at E6
+def MAX_MKT_NOTIONAL : UInt64 := 100_000_000_000_000_000 -- $100B notional cap per market (`8 * 10^17 << 2^64`)
 def MAX_RAW          : UInt64 := 10_000_000_000_000_000 -- 1000x MAX_OI post-ADL rawBasis cap
 def MAX_CREATE_FEE   : UInt64 := 10_000_000_000     -- 10,000 quote units at E6
 def MIN_EXIT_WINDOW  : UInt64 := 10                 -- minimum wind-down exit window (slots)

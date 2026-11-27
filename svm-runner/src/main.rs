@@ -3118,12 +3118,13 @@ fn main() {
     assert_dex_invariants(&svm, &w_dex, &w_vault, &w_mkts, &w_all_pfls, "suite11-post-b4-handoff");
 
     // 11.6 LIQUIDATION KEEPER WORST-CASE (8-LEG VICTIM + 8-LEG LIQUIDATOR + A2 POST-ADL RECOVERY!):
-    //   Pump mkts 4..7 (User A is Short) over 18 slots (0.7%/slot) to drain freeCapital near 0,
-    //   and drop mkt 0 (User A is Long 1.6) 4 slots (-2.8%) so mkt 0 is underwater (`0 < free+lock < legMm`,
-    //   NOT bankrupt — Bug 1C forces full close if `free==0 && lock==0`!)
+    //   Pump mkts 4..7 (User A is Short) over 19 slots (0.7%/slot) to drain freeCapital near 0
+    //   without making mkts 4..7 bankrupt (`shortfall == 0`, honoring #109),
+    //   and drop mkt 0 (User A is Long 1.6) 4 slots (-2.8%) so mkt 0 is underwater (`0 < free+lock < legMm`)
+    //   and partial liquidation (`reqQty = 0.8`) restores health (`postEq >= remMm`, honoring #107)!
     let mut p0 = 100_700_000u64;
     let mut p_hi = 100_700_000u64;
-    for step_idx in 0..22 {
+    for step_idx in 0..19 {
         w_slot += 1;
         set_slot(&mut svm, w_slot);
         p_hi = p_hi + (p_hi * 7) / 1000;
@@ -3165,10 +3166,14 @@ fn main() {
     let dk_l = (read_u64(&svm, &w_mkts[0], 304) - k_l0) as u128;
     let dk_s = (k_s0 - read_u64(&svm, &w_mkts[0], 312)) as u128;
     assert!(rs0 * dk_s >= rl0 * dk_l, "Gap #4B violation: asymmetric-ADL losing Shorts under-collected ({} < {})!", rs0 * dk_s, rl0 * dk_l);
-    //   Step back down to p0 so User A stays underwater for 11.6c Takeover!
-    w_slot += 1;
-    set_slot(&mut svm, w_slot);
-    send_ok(&mut svm, ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0, 0, 0), &payer, &[&payer, &w_orc_shared]);
+    //   Step mkt 0 down so User A's restored 0.8 Long becomes underwater again for 11.6c Takeover!
+    let mut p0_cur = p0_up;
+    for _ in 0..5 {
+        w_slot += 1;
+        set_slot(&mut svm, w_slot);
+        p0_cur = p0_cur - (p0_cur * 7) / 1000;
+        send_ok(&mut svm, ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0_cur, 0, 0), &payer, &[&payer, &w_orc_shared]);
+    }
 
     //   11.6b A2 POST-ADL RECOVERY #1: Post-ADL `Trade(mode = 0)` new open on partially-ADL'd mkt 0!
     //   Refresh Aux & Keeper legs, then open 0.5 new OI on partially-ADL'd mkt 0!
@@ -3285,9 +3290,15 @@ fn main() {
     println!("       Crank 8-mkt Batch    [8x UpdateOracle 1 tx]   : {:>6} CU | {:>4} B / 1232 B", cu_crank_8orc, wire_8orc);
     println!("       Crank 8-mkt CPI/Sweep[OracleAdapter max/8x]   : {:>6} / {:>5} CU | ForceClose max={} CU, Resolve max={} CU", cpi_crank_max_cu, cpi_crank_total_cu, max_fc_cu, max_res_cu);
     // =========================================================================
-    // SUITE 12: 14 Boring Everyday Exchange LiteSVM Functional Tests
+    // SUITE 12: 19 Boring Everyday Exchange, Security & Flash-Arb Limit-Order Tests
     // =========================================================================
-    boring_tests::run_all_boring_tests(&elf, &matcher_elf);
+    let limit_matcher_path = std::env::args()
+        .nth(7)
+        .unwrap_or_else(|| "build/limit_matcher.so".to_string());
+    let limit_matcher_elf = std::fs::read(&limit_matcher_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", limit_matcher_path, e));
+    assert_sbpf_v3_elf(&limit_matcher_path, &limit_matcher_elf);
+    boring_tests::run_all_boring_tests(&elf, &matcher_elf, &limit_matcher_elf);
 
     // =========================================================================
     // SUITE 13: Gavel-Style `xy = k` Virtual-Reserve X-Minute Uniform-Price Batch
@@ -4396,11 +4407,13 @@ fn main() {
         let sl_16a = get_slot(&svm) + 1;
         set_slot(&mut svm, sl_16a);
         send_ok(&mut svm, ix_update_oracle(prog_id, x_btc_mkt, x_btc_orc.pubkey(), 100 * POS_SCALE, 0, 0), &payer, &[&payer, &x_btc_orc]);
-        // RefreshLeg(M_atk, P_atk) + Liquidate(M_atk, P_atk) drains freeCapital -> 0 & M_atk.lockedMm -> 0
+        // Bankrupt `RefreshLeg(M_atk, P_atk)` is rejected (`Custom(107)`, #109);
+        // `Liquidate(M_atk, P_atk)` settles `M_atk` directly, draining freeCapital -> 0 & M_atk.lockedMm -> 0
         // (including any keeper liqFee attempt on M_atk!), YET BTC.lockedMm MUST remain EXACT $50!
+        send_err_custom(&mut svm, ix_refresh_leg(prog_id, x_dex, x_atk_mkt, p_atk, false),
+            &payer, &[&payer], 107, "16A: bankrupt RefreshLeg(M_atk) rejected (Custom 107)");
         send_ixs_ok(&mut svm, &[
             ix_refresh_leg(prog_id, x_dex, x_btc_mkt, p_atk, false),
-            ix_refresh_leg(prog_id, x_dex, x_atk_mkt, p_atk, false),
             ix_liquidate(prog_id, x_dex, x_atk_mkt, p_atk, keeper_tok, mint, x_vault, TOKEN_PROGRAM_ID),
         ], &payer, &[&payer]);
         assert_eq!(pfl_free_capital(&svm, &p_atk), 0, "16A: freeCapital drained to 0 by M_atk");

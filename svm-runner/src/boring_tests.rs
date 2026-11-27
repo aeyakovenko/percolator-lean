@@ -42,6 +42,17 @@ struct Trader {
     init_spl: u64,
 }
 
+fn find_leg(e: &BoringEnv, pfl: Address, mkt: Address) -> (u8, u64) {
+    let mid = read_u64(&e.svm, &mkt, 8);
+    for slot in 0..8usize {
+        let base = 144 + slot * 104;
+        if read_u8(&e.svm, &pfl, base) != 0 && read_u64(&e.svm, &pfl, base + 8) == mid {
+            return (read_u8(&e.svm, &pfl, base + 1), read_u64(&e.svm, &pfl, base + 48));
+        }
+    }
+    (0, 0)
+}
+
 impl BoringEnv {
     fn new(elf: &[u8]) -> Self {
         let mut svm = LiteSVM::new();
@@ -2100,8 +2111,754 @@ pub fn test_18_mode4_netting_flip_and_adversarial_edge_cases(elf: &[u8]) {
     e.check("t18-winddown-mode4");
 }
 
-/// Runs all 18 boring everyday exchange + security regression LiteSVM tests as Suite 12.
-pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
+/// Test 19: Full Hyperliquid-Parity Zero-ABI-Change Personal Orderbook Matcher (`limit_matcher.so`, 864B / 8 slots)
+///          + 1-Tx Atomic Flash-Loan-Style Crossing Arb!
+///   Tests ALL 13 emulated Hyperliquid modes end-to-end on real Agave 4.3.2 / sBPF v3 with ZERO core ABI changes:
+///     (a) `SysvarInstructions` caller auth blocks standalone griefing (`Custom(302)` `LErr.wrongCaller`)
+///     (b) 1-tx atomic flash-arb clearing crossing GTC Limit Buy ($100.50) vs Sell ($99.75) with 0 maker sigs
+///     (c) GTD slot expiry, ALO Post-Only, FOK (all-or-none), Reduce-Only (`mode==1` only), & Price Improvement
+///     (d) Linked OCO Take-Profit + Stop-Loss (filling TP atomically zeroes & deactivates linked SL!)
+///     (e) Stop-Loss Limit with slippagebps (`paramA`) & worst-price floor (`limitPrice`)
+///     (f) Trailing Stop with permissionless `Op 5 CrankTrailing` watermark ratchet (monotone!)
+///     (g) TWAP slicer (`sliceQty` + `intervalSlots`), Multi-Market Batch Fill (`k = 2`), `CancelOrder`, & `CancelAll`
+pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher_elf: &[u8]) {
+    const SYSVAR_IX_ID: Address =
+        Address::from_str_const("Sysvar1nstructions1111111111111111111111111");
+    const LIMIT_BOOK_SIZE: usize = 864;
+    const ORD_LIMIT: u8         = 0;
+    const ORD_STOP_LOSS: u8     = 1;
+    const ORD_TAKE_PROFIT: u8   = 2;
+    const ORD_TRAILING_STOP: u8 = 3;
+    const ORD_TWAP: u8          = 4;
+    const FLAG_POST_ONLY: u8     = 1;
+    const FLAG_FOK: u8           = 2;
+    const FLAG_REDUCE_ONLY: u8   = 4;
+    const FLAG_PRICE_IMPROVE: u8 = 8;
+    const OCO_NONE: u8           = 0xFF;
+
+    let slot_off = |slot: usize| 224 + slot * 80;
+
+    let ix_init_book = |lm_prog: Address, ctx: Address, owner: Address, perc_prog: Address| {
+        Instruction {
+            program_id: lm_prog,
+            accounts: vec![
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(owner, true),
+                AccountMeta::new_readonly(perc_prog, false),
+            ],
+            data: vec![0u8],
+        }
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    let ix_place_order = |lm_prog: Address, ctx: Address, owner: Address,
+                          slot: u8, otype: u8, maker_is_buy: bool, flags: u8, oco_link: u8,
+                          mid: u64, limit_price: u64, trig_price: u64, rem_qty: u64, expiry_slot: u64, param_a: u64| {
+        let mut d = Vec::with_capacity(54);
+        d.push(1u8); // Op 1: PlaceOrder
+        d.push(slot);
+        d.push(otype);
+        d.push(if maker_is_buy { 1 } else { 0 });
+        d.push(flags);
+        d.push(oco_link);
+        d.extend_from_slice(&mid.to_le_bytes());
+        d.extend_from_slice(&limit_price.to_le_bytes());
+        d.extend_from_slice(&trig_price.to_le_bytes());
+        d.extend_from_slice(&rem_qty.to_le_bytes());
+        d.extend_from_slice(&expiry_slot.to_le_bytes());
+        d.extend_from_slice(&param_a.to_le_bytes());
+        Instruction {
+            program_id: lm_prog,
+            accounts: vec![
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(owner, true),
+            ],
+            data: d,
+        }
+    };
+
+    let ix_cancel_order = |lm_prog: Address, ctx: Address, owner: Address, slot: u8| {
+        Instruction {
+            program_id: lm_prog,
+            accounts: vec![
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(owner, true),
+            ],
+            data: vec![3u8, slot],
+        }
+    };
+
+    let ix_cancel_all = |lm_prog: Address, ctx: Address, owner: Address| {
+        Instruction {
+            program_id: lm_prog,
+            accounts: vec![
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(owner, true),
+            ],
+            data: vec![4u8],
+        }
+    };
+
+    let ix_crank_trailing = |lm_prog: Address, ctx: Address, mkt: Address, slot: u8| {
+        Instruction {
+            program_id: lm_prog,
+            accounts: vec![
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(mkt, false),
+            ],
+            data: vec![5u8, slot],
+        }
+    };
+
+    let mut e = BoringEnv::new(elf);
+    let lm_prog = Keypair::new().pubkey();
+    e.svm.add_program(lm_prog, limit_matcher_elf).expect("limit_matcher ELF load failed");
+
+    // BTC & ETH @ $100, IM = 10%, MM = 5%, liqFee = 1%, tradeFee = 5 bps ($0.05/unit), maxMove = 75 bps ($0.75/unit)
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 5, 75);
+    let eth = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 5, 75);
+    let btc_mid = read_u64(&e.svm, &btc, 8);
+    let eth_mid = read_u64(&e.svm, &eth, 8);
+
+    let alice    = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    let bob      = e.create_trader(1_000 * POS_SCALE, 200 * POS_SCALE);
+    // Searcher starts with $0 deposited on the DEX — holds $400 USDC in wallet (flash borrow float + later mode tests)
+    let searcher = e.create_trader(400 * POS_SCALE, 0);
+
+    // Initialize 864B 8-slot personal orderbooks for Alice & Bob and bind via SetPortfolioMatcher
+    let alice_ctx = create_prog_acc(&mut e.svm, &lm_prog, LIMIT_BOOK_SIZE);
+    let bob_ctx   = create_prog_acc(&mut e.svm, &lm_prog, LIMIT_BOOK_SIZE);
+    send_ok(&mut e.svm, ix_init_book(lm_prog, alice_ctx, alice.kp.pubkey(), e.prog_id), &e.payer, &[&e.payer, &alice.kp]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, alice.pfl, alice.kp.pubkey(), Some(alice_ctx)), &e.payer, &[&e.payer, &alice.kp]);
+    send_ok(&mut e.svm, ix_init_book(lm_prog, bob_ctx, bob.kp.pubkey(), e.prog_id), &e.payer, &[&e.payer, &bob.kp]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, bob.pfl, bob.kp.pubkey(), Some(bob_ctx)), &e.payer, &[&e.payer, &bob.kp]);
+
+    // Alice places Slot 0: GTC Limit Buy 2 BTC @ $100.50; Bob places Slot 0: GTC Limit Sell 2 BTC @ $99.75
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, true, 0, OCO_NONE, btc_mid, 100_500_000, 0, 2 * POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, bob_ctx, bob.kp.pubkey(), 0, ORD_LIMIT, false, 0, OCO_NONE, btc_mid, 99_750_000, 0, 2 * POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &bob.kp],
+    );
+
+    // (a) Direct griefing call to LimitMatcher::Op 2 outside Percolator::TradeWithMatcher MUST FAIL (`Custom(302)` LErr.wrongCaller)!
+    let mut spoof_req = vec![0u8; 80];
+    spoof_req[0] = 2; // Op 2: FillOrders
+    spoof_req[1] = 1; // k = 1
+    spoof_req[24..32].copy_from_slice(&1u64.to_le_bytes());
+    spoof_req[32] = 4; // mode = 4
+    spoof_req[33] = 0; // takerIsLong = 0
+    spoof_req[40..48].copy_from_slice(&btc_mid.to_le_bytes());
+    spoof_req[48..56].copy_from_slice(&(2 * POS_SCALE).to_le_bytes());
+    spoof_req[64..72].copy_from_slice(&(100 * POS_SCALE).to_le_bytes());
+    let spoof_ix = Instruction {
+        program_id: lm_prog,
+        accounts: vec![
+            AccountMeta::new(alice_ctx, false),
+            AccountMeta::new_readonly(SYSVAR_IX_ID, false),
+        ],
+        data: spoof_req,
+    };
+    send_err_custom(
+        &mut e.svm, spoof_ix, &e.payer, &[&e.payer], 302,
+        "Direct standalone call to LimitMatcher::Op 2 must fail SysvarInstructions caller auth",
+    );
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(0) + 32), 2 * POS_SCALE, "Griefing probe must NOT decrement Alice remainingQty!");
+
+    // (b) ONE atomic flash-loan-style arb tx by Searcher (ZERO signatures from Alice or Bob, ZERO ABI changes!):
+    let searcher_spl_before = e.spl(&searcher);
+    let alice_cap_before    = e.capital(&alice);
+    let bob_cap_before      = e.capital(&bob);
+
+    let flash_arb_ixs = vec![
+        ix_deposit_collateral(
+            e.prog_id, e.dex, searcher.pfl, searcher.kp.pubkey(), searcher.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 20_100_000,
+        ),
+        ix_trade_with_matcher(
+            e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), bob.pfl,
+            lm_prog, bob_ctx, Some(SYSVAR_IX_ID), 4, true, 2 * POS_SCALE, 100 * POS_SCALE,
+        ),
+        ix_trade_with_matcher(
+            e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl,
+            lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, 2 * POS_SCALE, 100 * POS_SCALE,
+        ),
+        ix_withdraw_collateral(
+            e.prog_id, e.dex, searcher.pfl, searcher.kp.pubkey(), searcher.tok,
+            e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 21_500_000,
+        ),
+    ];
+    let arb_cu = send_ixs_ok(&mut e.svm, &flash_arb_ixs, &e.payer, &[&e.payer, &searcher.kp]);
+
+    assert_eq!(e.capital(&searcher), 0, "Searcher left $0 on DEX after atomic flash-arb withdraw");
+    assert_eq!(read_u8(&e.svm, &searcher.pfl, 4), 0, "Searcher is 100% flat (0 active legs)");
+    assert_eq!(e.spl(&searcher), searcher_spl_before + 1_400_000, "Searcher captured exact +$1.40 net spread in 1 atomic tx!");
+    assert_eq!(e.oi_long(btc), 2 * POS_SCALE);
+    assert_eq!(e.capital(&alice), alice_cap_before - 1_100_000);
+    assert_eq!(e.capital(&bob), bob_cap_before - 600_000);
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(0)), 0, "Alice slot 0 deactivated on full fill");
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(0) + 32), 0, "Alice slot 0 remainingQty == 0");
+    assert_eq!(read_u64(&e.svm, &bob_ctx,   slot_off(0) + 32), 0, "Bob slot 0 remainingQty == 0");
+    e.check("t19-after-flash-arb");
+
+    // Re-filling depleted book fails with Custom(301) (`LErr.noMatchingOrd`)!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(
+            e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl,
+            lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0,
+        ),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "Empty orderbook cannot be filled",
+    );
+
+    // (c) GTD Expiry + ALO Post-Only + FOK + Reduce-Only + Price-Improve!
+    e.deposit(&searcher, 200 * POS_SCALE);
+
+    // GTD: expirySlot = curSlot + 2; advance 3 slots -> rejected (`Custom(301)`)!
+    let gtd_exp = e.slot + 2;
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, true, 0, OCO_NONE, btc_mid, 100_250_000, 0, POS_SCALE, gtd_exp, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    e.advance_slot(3);
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "GTD order past expirySlot must be rejected",
+    );
+
+    // ALO (Post-Only): Buy @ $100.25 > mark ($100) rejected (`Custom(301)`); Buy @ $99.50 <= mark fills!
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, true, FLAG_POST_ONLY, OCO_NONE, btc_mid, 100_250_000, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "ALO Post-Only Buy above markPrice must be rejected",
+    );
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, true, FLAG_POST_ONLY, OCO_NONE, btc_mid, 99_500_000, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    // Alice is now Long 3 BTC, Searcher Short 1 BTC, Bob Short 2 BTC.
+
+    // FOK: Sell 2 BTC @ $100.00 with FLAG_FOK -> partial qty=1 rejected (`Custom(301)`), full qty=2 fills!
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, false, FLAG_FOK, OCO_NONE, btc_mid, 100 * POS_SCALE, 0, 2 * POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "FOK order must reject partial fill (1 < 2)",
+    );
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, 2 * POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    // Alice Long 1 BTC, Searcher Long 1 BTC, Bob Short 2 BTC.
+
+    // Reduce-Only + Price-Improve: Alice (Long 1 BTC) places Sell 1 BTC @ $99.50 with REDUCE_ONLY | PRICE_IMPROVE!
+    //   - mode=0 rejected (`Custom(301)`) by REDUCE_ONLY
+    //   - mode=1 (Bob Short 2 closing 1 against Alice Long 1) succeeds AND price-improves $99.50 -> $100.00 (0 spread paid by Alice)!
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, false, FLAG_REDUCE_ONLY | FLAG_PRICE_IMPROVE, OCO_NONE, btc_mid, 99_500_000, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 0, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "REDUCE_ONLY order must reject mode=0 (open)",
+    );
+    let alice_cap_pre_pi = e.capital(&alice);
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, bob.pfl, bob.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 1, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &bob.kp],
+    );
+    assert_eq!(e.capital(&alice), alice_cap_pre_pi, "PRICE_IMPROVE upgraded Alice's $99.50 sell to $100.00 mark (exact $0 spread loss)!");
+    assert_eq!(find_leg(&e, alice.pfl, btc), (0, 0), "Alice Long 1 reduced cleanly to Flat");
+    // Close remaining Searcher Long 1 vs Bob Short 1 so everyone starts clean for TP/SL/OCO/Trailing/TWAP!
+    e.trade(btc, &searcher, &bob, 1, POS_SCALE);
+    assert_eq!(e.oi_long(btc), 0);
+
+    // (d) Linked OCO Take-Profit + Stop-Loss:
+    //     Alice opens Long 1 BTC vs Searcher Short 1 BTC at $100, sets OCO bracket:
+    //       Slot 1: Take-Profit Market Sell 1 BTC @ trigger $102.00 (ocoLink = 2)
+    //       Slot 2: Stop-Loss   Market Sell 1 BTC @ trigger $98.00  (ocoLink = 1)
+    e.trade(btc, &alice, &searcher, 0, POS_SCALE);
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 1, ORD_TAKE_PROFIT, false, 0, 2, btc_mid, 0, 102 * POS_SCALE, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 2, ORD_STOP_LOSS, false, 0, 1, btc_mid, 0, 98 * POS_SCALE, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    // At $100.00 neither TP ($102) nor SL ($98) fires!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "Untriggered TP/SL OCO bracket must not fill at $100",
+    );
+    // Move BTC to $102.00 -> TP fills AND atomically zeroes/deactivates linked SL (Slot 2)!
+    e.update_oracle(btc, 102 * POS_SCALE, 0, 0);
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(1)), 0, "TP slot 1 filled & deactivated");
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(2)), 0, "Linked OCO SL slot 2 ATOMICALLY deactivated!");
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(2) + 32), 0, "Linked OCO SL slot 2 remainingQty == 0!");
+    assert_eq!(e.oi_long(btc), 0);
+    e.check("t19-after-oco-tp");
+
+    // (e) Stop-Loss Limit with slippageBps (`paramA = 25 bps` = $0.25 at $100) + worst-price floor (`limitP = $99.50`):
+    e.trade(btc, &alice, &searcher, 0, POS_SCALE); // Open at $102.00
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 3, ORD_STOP_LOSS, false, 0, OCO_NONE, btc_mid, 99_500_000, 100 * POS_SCALE, POS_SCALE, 0, 25),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    // At $102.00 SL ($100) has not triggered
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "Stop-Loss at $100 must not trigger at $102",
+    );
+    // Drop BTC to $100.00 -> SL triggers and executes at $100 - 25 bps = $99.75 >= $99.50!
+    e.update_oracle(btc, 100 * POS_SCALE, 0, 0);
+    e.refresh(btc, &alice);
+    e.refresh(btc, &searcher);
+    let alice_cap_pre_sl = e.capital(&alice);
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(alice_cap_pre_sl - e.capital(&alice), 250_000, "Stop-Loss executed at exact $99.75 ($0.25 = 25 bps slippage)");
+    assert_eq!(e.oi_long(btc), 0);
+
+    // (f) Trailing Stop + Permissionless `Op 5 CrankTrailing` watermark ratchet (monotone!):
+    e.trade(btc, &alice, &searcher, 0, POS_SCALE); // Open at $100.00
+    // Slot 4: Trailing Stop Sell 1 BTC, initial watermark = $100.00, trailBps = 200 (2%)
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 4, ORD_TRAILING_STOP, false, 0, OCO_NONE, btc_mid, 0, 100 * POS_SCALE, POS_SCALE, 0, 200),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    // Pump BTC to $105.00 -> permissionless crank (payer signs, NOT Alice!) ratchets watermark $100 -> $105!
+    e.update_oracle(btc, 105 * POS_SCALE, 0, 0);
+    send_ok(&mut e.svm, ix_crank_trailing(lm_prog, alice_ctx, btc, 4), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(4) + 24), 105 * POS_SCALE, "CrankTrailing ratcheted watermark to $105.00!");
+    // Retrace to $104.00 (> $105 * 0.98 = $102.90): CrankTrailing MUST NOT lower watermark, and fill MUST NOT trigger!
+    e.update_oracle(btc, 104 * POS_SCALE, 0, 0);
+    send_ok(&mut e.svm, ix_crank_trailing(lm_prog, alice_ctx, btc, 4), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(4) + 24), 105 * POS_SCALE, "Watermark is strictly monotone (stayed $105.00)");
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "Trailing stop ($102.90 trigger) must not fire at $104.00",
+    );
+    // Retrace to $102.50 (<= $102.90) -> Trailing Stop triggers and closes Alice Long 1 BTC!
+    e.update_oracle(btc, 102_500_000, 0, 0);
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(4)), 0, "Trailing stop filled & deactivated");
+    assert_eq!(e.oi_long(btc), 0);
+    e.check("t19-after-trailing");
+
+    // (g) TWAP Slicer + Multi-Market Batch Fill (`k = 2`) + CancelOrder + CancelAll:
+    //     Slot 5: TWAP Buy 2 BTC total, sliceQty = 1 BTC, intervalSlots = 5
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 5, ORD_TWAP, true, 0, OCO_NONE, btc_mid, 0, POS_SCALE, 2 * POS_SCALE, 0, 5),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    // Searcher requests maxQty=2 BTC -> TWAP enforces sliceQty=1 BTC!
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, 2 * POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, POS_SCALE), "TWAP capped slice 1 to exact 1 BTC");
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(5) + 32), POS_SCALE, "TWAP remainingQty == 1 BTC");
+    // Too early (+2 slots < 5): rejected (`Custom(301)`)!
+    e.advance_slot(2);
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "TWAP must reject second slice before intervalSlots elapses",
+    );
+    // Advance +3 more slots (total +5 == intervalSlots): second slice fills!
+    e.advance_slot(3);
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 2 * POS_SCALE), "TWAP filled slice 2 -> Long 2 BTC total");
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(5)), 0, "TWAP completed & deactivated");
+
+    // Multi-Market Batch Fill (`k = 2`): refresh ETH oracle, place BTC Buy (Slot 6) + ETH Sell (Slot 7), fill BOTH in 1 CPI!
+    e.update_oracle(eth, 100 * POS_SCALE, 0, 0);
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 6, ORD_LIMIT, true, 0, OCO_NONE, btc_mid, 102_500_000, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 7, ORD_LIMIT, false, 0, OCO_NONE, eth_mid, 100 * POS_SCALE, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher_batch(
+            e.prog_id, e.dex, searcher.pfl, searcher.kp.pubkey(), alice.pfl,
+            lm_prog, alice_ctx,
+            &[(btc, 4, false, POS_SCALE, 0), (eth, 4, true, POS_SCALE, 0)],
+            Some(SYSVAR_IX_ID),
+        ),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 3 * POS_SCALE), "Batch fill k=2 added BTC Long +1");
+    assert_eq!(find_leg(&e, alice.pfl, eth), (2, 1 * POS_SCALE), "Batch fill k=2 opened ETH Short 1");
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(6)), 0);
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(7)), 0);
+
+    // CancelOrder & CancelAll: place Slot 0 + Slot 1, cancel Slot 0, then CancelAll!
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0, ORD_LIMIT, true, 0, OCO_NONE, btc_mid, 102 * POS_SCALE, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 1, ORD_LIMIT, false, 0, OCO_NONE, eth_mid, 100 * POS_SCALE, 0, POS_SCALE, 0, 0),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(&mut e.svm, ix_cancel_order(lm_prog, alice_ctx, alice.kp.pubkey(), 0), &e.payer, &[&e.payer, &alice.kp]);
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(0)), 0, "CancelOrder cleared slot 0");
+    assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(1)), 1, "CancelOrder left slot 1 active");
+    send_ok(&mut e.svm, ix_cancel_all(lm_prog, alice_ctx, alice.kp.pubkey()), &e.payer, &[&e.payer, &alice.kp]);
+    for s in 0..8 {
+        assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(s)), 0, "CancelAll cleared all 8 slots");
+    }
+    e.check("t19-final-all-hl-modes");
+    println!("       [t19] ALL 13 HL orderbook modes verified + 1-tx flash-arb in {} CU (0 ABI changes, 0 maker sigs!)", arb_cu);
+}
+
+/// Test 20: PR #8 Security Regression — Non-Liquidation Bankrupt Settlement Blocked (`allowBankrupt = false`)!
+///   Reproduces PR #8's exact market parameters (`maxMoveBps=100, liqFeeBps=50, mmBps=565, imBps=665`,
+///   `maxFrontBps=10000`, `I_m=$100`, SHORT funded at exact IM `$6.65`, 7-slot pump `$100 -> $107.20`):
+///     1. Proves PR #8's claim ("SHORT is not liquidatable") is FALSE: an identical twin `bob_early`
+///        IS liquidatable on **slot 1** (`$100 -> $101`, 6 slots before bankruptcy!) with 0 bad debt & 0 `I_m` draw.
+///     2. After a 7-slot total keeper outage (`$100 -> $107.20`, exceeding `K=4`) where Alice refreshes first
+///        (`Mkt.insFronted = $7.20`) and bankrupt Bob has `loss=$7.20 > capital=$6.65` (`rawSf=$0.55 > 0`):
+///        - `TradeWithMatcher(mode=1, execPrice=markP)` is HARD REJECTED (`Custom(107)` `PErr.insufficientMargin`)!
+///        - Direct `Trade(mode=1)` is HARD REJECTED (`Custom(107)`)!
+///        - Permissionless `RefreshLeg(Bob)` is HARD REJECTED (`Custom(107)`)!
+///        - `Mkt.insFronted` stays exact `$7.20` (zero silent write-off!) and `I_m` is untouched!
+///     3. `handleLiquidate(Bob)` SUCCEEDS, repays `$6.65` back into `I_m`, cleanly accounts for only the
+///        `$0.55` outage shortfall via the liquidation waterfall, and preserves all DEX invariants!
+pub fn test_20_pr8_bankrupt_settlement_blocked_regression(elf: &[u8], matcher_elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let m_prog = Keypair::new().pubkey();
+    e.svm.add_program(m_prog, matcher_elf).expect("matcher ELF load failed");
+
+    // Exact PR #8 boundary parameters: maxMove=100, liqFee=50, mm=565, im=665, maxFrontBps=10000
+    let admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    let mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let mut cm_ix = ix_create_market(
+        e.prog_id, e.dex, mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+        100 * POS_SCALE, 10, 50, 0, 665, 565, 50, 0, 100, 10_000, 1_000_000 * POS_SCALE,
+    );
+    cm_ix.data[2..4].copy_from_slice(&10_000u16.to_le_bytes()); // maxFrontBps = 10000
+    send_ok(&mut e.svm, cm_ix, &e.payer, &[&e.payer, &e.admin]);
+    e.markets.push(mkt);
+    let mid = read_u64(&e.svm, &mkt, 8);
+
+    // Identical twin market `mkt_early` to prove slot-1 liquidation without triggering ADL on `mkt`
+    let mkt_early = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let mut cm_early = ix_create_market(
+        e.prog_id, e.dex, mkt_early, e.mint, e.oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+        100 * POS_SCALE, 10, 50, 0, 665, 565, 50, 0, 100, 10_000, 1_000_000 * POS_SCALE,
+    );
+    cm_early.data[2..4].copy_from_slice(&10_000u16.to_le_bytes());
+    send_ok(&mut e.svm, cm_early, &e.payer, &[&e.payer, &e.admin]);
+    e.markets.push(mkt_early);
+
+    // Seed I_m = $100 from LP on both markets
+    let lp_kp = Keypair::new();
+    e.svm.airdrop(&lp_kp.pubkey(), 1_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_kp.pubkey(), 300 * POS_SCALE);
+    let r_lp = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, mkt, r_lp, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE),
+        &e.payer, &[&e.payer, &lp_kp],
+    );
+    let r_lp_early = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, mkt_early, r_lp_early, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE),
+        &e.payer, &[&e.payer, &lp_kp],
+    );
+
+    let keeper = Keypair::new();
+    e.svm.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+    let keeper_tok = create_tok_acc(&mut e.svm, &e.mint, &keeper.pubkey(), 0);
+
+    // Two identical pairs at exact min IM ($6.65 for SHORT):
+    //   Pair 1 (alice_early vs bob_early on mkt_early): proves liquidation works immediately on slot 1 ($101)!
+    //   Pair 2 (alice vs bob on mkt): simulates 7-slot keeper outage ($100 -> $107.20) reaching bankruptcy!
+    let alice_early = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    let bob_early   = e.create_trader(100 * POS_SCALE, 6_650_000);
+    let alice       = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    let bob         = e.create_trader(100 * POS_SCALE, 6_650_000);
+
+    e.trade(mkt_early, &alice_early, &bob_early, 0, POS_SCALE);
+    e.trade(mkt,       &alice,       &bob,       0, POS_SCALE);
+
+    // Bind 0-spread AMM matcher to Bob so Alice can attempt PR #8's `TradeWithMatcher(mode=1, execPrice=markP)`
+    let m_ctx = create_prog_acc(&mut e.svm, &m_prog, PROP_AMM_SIZE);
+    send_ok(&mut e.svm, ix_init_prop_amm(m_prog, m_ctx, bob.kp.pubkey(), 0, 0, 0, 10 * POS_SCALE, &[mid]), &e.payer, &[&e.payer, &bob.kp]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, bob.pfl, bob.kp.pubkey(), Some(m_ctx)), &e.payer, &[&e.payer, &bob.kp]);
+
+    // Step 1: 1-slot +1% pump ($100 -> $101) on `mkt_early`:
+    //   bob_early has loss=$1.00 -> equity=$5.65 < mmReq($101)=$5.7065 -> LIQUIDATABLE ON SLOT 1 (0 bad debt, 0 I_m draw)!
+    e.update_oracle(mkt_early, 101 * POS_SCALE, 0, 0);
+    send_ok(
+        &mut e.svm,
+        ix_liquidate(e.prog_id, e.dex, mkt_early, bob_early.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer],
+    );
+    assert_eq!(find_leg(&e, bob_early.pfl, mkt_early), (0, 0), "bob_early liquidated immediately on slot 1!");
+    assert_eq!(read_u64(&e.svm, &mkt_early, 224), 100 * POS_SCALE, "Slot-1 liquidation had ZERO I_m draw!");
+    e.refresh(mkt_early, &alice_early);
+    e.check("t20-slot1-liq");
+
+    // Step 2: 7 consecutive 1% pumps ($100 -> $107.20) on `mkt` with ZERO liquidations on `bob` (7-slot outage > K=4!)
+    e.update_oracle(mkt, 107_200_000, 0, 0);
+
+    // Alice refreshes first -> I_m fronts exact $7.20 into Alice's freeCap!
+    e.refresh(mkt, &alice);
+    assert_eq!(read_u64(&e.svm, &mkt, 224), 92_800_000, "I_m cash dropped $100 -> $92.80 (fronted $7.20 to Alice)");
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 7_200_000,  "Mkt.insFronted == $7.20");
+
+    // Step 3: ALL non-liquidation settlement paths MUST hard-reject bankrupt Bob (`rawSf = $0.55 > 0`) with Custom(107)!
+    //   (i) PR #8 vector: TradeWithMatcher(mode=1, execPrice=markP)
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, mkt, alice.pfl, alice.kp.pubkey(), bob.pfl, m_prog, m_ctx, None, 1, true, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &alice.kp], 107,
+        "PR #8 vector: TradeWithMatcher(mode=1) MUST reject bankrupt counterparty (Custom 107)",
+    );
+    //   (ii) Direct bilateral Trade(mode=1)
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, mkt, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 1, POS_SCALE),
+        &e.payer, &[&e.payer, &alice.kp, &bob.kp], 107,
+        "Direct Trade(mode=1) MUST reject bankrupt counterparty (Custom 107)",
+    );
+    //   (iii) Permissionless RefreshLeg(Bob)
+    send_err_custom(
+        &mut e.svm,
+        ix_refresh_leg(e.prog_id, e.dex, mkt, bob.pfl, false),
+        &e.payer, &[&e.payer], 107,
+        "RefreshLeg MUST reject bankrupt leg instead of silently writing off insFronted (Custom 107)",
+    );
+    // Verify Mkt.insFronted & I_m are 100% untouched after all 3 blocked attacks!
+    assert_eq!(read_u64(&e.svm, &mkt, 224), 92_800_000, "I_m untouched after blocked attacks");
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 7_200_000,  "Mkt.insFronted untouched ($7.20 — zero silent write-off!)");
+
+    // Step 4: Keeper runs `handleLiquidate(Bob)` -> SUCCEEDS, repays $6.65 back into I_m ($92.80 -> $99.45),
+    //         and writes off ONLY the unavoidable $0.55 outage shortfall cleanly (NEVER double-drawn)!
+    send_ok(
+        &mut e.svm,
+        ix_liquidate(e.prog_id, e.dex, mkt, bob.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer],
+    );
+    assert_eq!(find_leg(&e, bob.pfl, mkt), (0, 0), "Bankrupt Bob liquidated cleanly via handleLiquidate");
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 0, "Mkt.insFronted fully cleared after liquidation ($6.65 repaid + $0.55 written off)");
+    assert_eq!(read_u64(&e.svm, &mkt, 224), 99_450_000, "I_m recovered $6.65 -> $99.45 (ONLY $0.55 outage loss, ZERO double-draw!)");
+    e.check("t20-after-liq");
+    println!("       [t20] PR #8 regression verified: slot-1 liq OK, bankrupt TradeWithMatcher/Trade/RefreshLeg blocked (107), handleLiquidate repaid $6.65!");
+}
+
+/// Test 21: Issue #107 Regression — Partial Liquidation Post-`liqFee` Solvency & `minMm` Margin Check!
+///   Proves a keeper CANNOT call partial liquidation (`reqQty = 20%`) on a thin solvent leg where `liqFee`
+///   would drain 100% of `availCap`, leaving an unbacked `$0`-capital 80% zombie leg that drains `I_m`
+///   on the next tick or gives a zero-capital rebound call option!
+pub fn test_21_issue107_partial_liq_post_fee_solvency(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    // BTC @ $100, im=10%, mm=5%, liqFee=1%, tradeFee=0, maxMove=75 bps ($0.75/slot)
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 75);
+
+    // Seed $50 insurance
+    let lp_kp = Keypair::new();
+    e.svm.airdrop(&lp_kp.pubkey(), 1_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_kp.pubkey(), 100 * POS_SCALE);
+    let r_lp = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, btc, r_lp, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 50 * POS_SCALE),
+        &e.payer, &[&e.payer, &lp_kp],
+    );
+
+    let keeper = Keypair::new();
+    e.svm.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+    let keeper_tok = create_tok_acc(&mut e.svm, &e.mint, &keeper.pubkey(), 0);
+
+    // Alice opens Long 10 BTC at $100 with exact IM ($100); Bob Short 10 BTC with $500
+    let alice = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    let bob   = e.create_trader(600 * POS_SCALE, 500 * POS_SCALE);
+    e.trade(btc, &alice, &bob, 0, 10 * POS_SCALE);
+
+    // Drop BTC from $100 -> $90.10 (-$9.90/BTC = -$99.00 loss on 10 BTC):
+    //   Alice is STILL SOLVENT (`shortfall == 0`), with tiny `availCap = $1.00`, `cachedMm = $45.05`!
+    e.update_oracle(btc, 90_100_000, 0, 0);
+
+    // Attack (#107): Keeper tries partial liquidation `reqQty = 2 BTC` (20% of 10 BTC):
+    //   `maxFee = 1% * 2 * $90.10 = $1.802` -> `liqFee = min($1.802, $1.00) = $1.00` (100% of availCap!),
+    //   leaving `postAvail = $0.00` on 8 BTC (`remMm = $36.04`)!
+    //   MUST BE HARD REJECTED with `Custom(103)` (`PErr.invalidParams`)!
+    send_err_custom(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 2 * POS_SCALE, None),
+        &e.payer, &[&e.payer], 103,
+        "Issue #107: partial liquidation leaving postAvail==0 or postEq < remMm MUST be rejected (Custom 103)",
+    );
+    // Even reqQty = 9 BTC (leaving 1 BTC with remMm=$4.505 > postAvail=$0) MUST be rejected!
+    send_err_custom(
+        &mut e.svm,
+        ix_liquidate_ext(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 0, 9 * POS_SCALE, None),
+        &e.payer, &[&e.payer], 103,
+        "Issue #107: any partial liquidation failing postEq >= remMm MUST be rejected (Custom 103)",
+    );
+    // Full liquidation (`reqQty = 0`) SUCCEEDS cleanly with ZERO insurance draw!
+    send_ok(
+        &mut e.svm,
+        ix_liquidate(e.prog_id, e.dex, btc, alice.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer],
+    );
+    assert_eq!(find_leg(&e, alice.pfl, btc), (0, 0), "Full liquidation closed Alice's leg completely");
+    assert_eq!(read_u64(&e.svm, &btc, 224), 50 * POS_SCALE, "ZERO insurance drawn!");
+    e.refresh(btc, &bob);
+    e.check("t21-issue107-after-full-liq");
+    println!("       [t21] Issue #107 regression verified: partial liq leaving zombie/under-MM leg rejected (103), full liq 0 insDraw!");
+}
+
+/// Test 22: Issue #110 & #109 Multi-Leg Regression — Self-Made Market Overflow DoS & 2-Bankrupt-Leg Deadlock Blocked!
+///   Proves:
+///     1. `CreateMarket` + `UpdateOracle` enforce `MAX_MKT_NOTIONAL = 10^17` ($100B) so `syncLegMargins` never overflows `u64`.
+///     2. `settleAndRefreshLeg` saturating arithmetic (`mulDiv64Sat` / `mulDiv64CeilSat`) prevents `ArithmeticOverflow`
+///        even if an attacker pumps a self-made market + cranks funding relentlessly.
+///     3. A bankrupt leg (`shortfall > 0 || (freeCap == 0 && legLock == 0)`) skips `checkAllLegsFreshLoop` in `handleLiquidate`,
+///        so an attacker's poisoned/bankrupt self-made market leg (OR two simultaneously bankrupt legs) can NEVER deadlock liquidation!
+pub fn test_22_issue110_self_made_market_overflow_dos_blocked(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 75);
+
+    // Self-made adversarial market `m_atk`: initPrice = $1, im=100%, mm=80%, liqFee=1%, maxMove=10% (1000 bps)
+    let atk_oracle = Keypair::new();
+    e.svm.airdrop(&atk_oracle.pubkey(), 1_000_000_000).unwrap();
+    let admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    let m_atk = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, e.dex, m_atk, e.mint, atk_oracle.pubkey(), e.admin.pubkey(), admin_tok, e.fee_vault,
+            1 * POS_SCALE, 10, 50, 0, 10_000, 8_000, 100, 0, 1000, 2500, 10_000_000 * POS_SCALE,
+        ),
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    e.markets.push(m_atk);
+
+    let keeper = Keypair::new();
+    e.svm.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+    let keeper_tok = create_tok_acc(&mut e.svm, &e.mint, &keeper.pubkey(), 0);
+
+    // Attacker opens Short 1 BTC at $100 (minimal $10 IM) AND Short 1 unit on `m_atk` at $1 ($1 IM) -> total $12 deposited
+    let honest_l  = e.create_trader(500 * POS_SCALE, 200 * POS_SCALE);
+    let attacker  = e.create_trader(500 * POS_SCALE, 12 * POS_SCALE);
+    let atk_mate  = e.create_trader(500 * POS_SCALE, 50 * POS_SCALE);
+
+    e.trade(btc,   &honest_l, &attacker, 0, 1 * POS_SCALE);
+    e.trade(m_atk, &atk_mate, &attacker, 0, 1 * POS_SCALE);
+
+    // Attacker pumps BOTH `btc` (+6% -> $106, making BTC leg bankrupt-ish/under-MM) AND `m_atk` (+150% -> $2.50 + funding -> bankrupt!)
+    // so BOTH legs are simultaneously stale AND bankrupt (`#109` 2-bankrupt-leg deadlock + `#110` self-made market DoS)!
+    e.update_oracle(btc, 113 * POS_SCALE, 0, 0); // +$13 loss > $12 total capital -> BTC leg is BANKRUPT!
+    for _ in 0..15 {
+        let cur_p = read_u64(&e.svm, &m_atk, 112);
+        let next_p = cur_p + cur_p / 20; // +5% price + 5% funding = 10% maxMove!
+        let fund = cur_p / 20;
+        e.advance_slot(1);
+        send_ok(
+            &mut e.svm,
+            ix_update_oracle(e.prog_id, m_atk, atk_oracle.pubkey(), next_p, 2, fund),
+            &e.payer, &[&e.payer, &atk_oracle],
+        );
+    }
+    // Verify BOTH legs are unrefreshable via `RefreshLeg` (bankrupt -> Custom 107), yet `Liquidate(btc)` STILL SUCCEEDS
+    // immediately because bankrupt legs skip `checkAllLegsFreshLoop`, AND `Liquidate(m_atk)` ALSO SUCCEEDS!
+    send_err_custom(
+        &mut e.svm,
+        ix_refresh_leg(e.prog_id, e.dex, btc, attacker.pfl, false),
+        &e.payer, &[&e.payer], 107,
+        "Bankrupt BTC leg rejected by RefreshLeg (107)",
+    );
+    send_ok(
+        &mut e.svm,
+        ix_liquidate(e.prog_id, e.dex, btc, attacker.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer],
+    );
+    assert_eq!(find_leg(&e, attacker.pfl, btc), (0, 0), "Bankrupt BTC leg liquidated WITHOUT being blocked by self-made m_atk!");
+    send_ok(
+        &mut e.svm,
+        ix_liquidate(e.prog_id, e.dex, m_atk, attacker.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer],
+    );
+    assert_eq!(find_leg(&e, attacker.pfl, m_atk), (0, 0), "Bankrupt m_atk leg also liquidated cleanly!");
+    e.check("t22-issue110-after-both-liqs");
+    println!("       [t22] Issue #110 + #109 deadlock regression verified: bankrupt BTC & self-made m_atk both liquidated cleanly!");
+}
+
+/// Runs all 22 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
+pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
     test_boring_scale_in_and_partial_closes(elf);
@@ -2120,41 +2877,48 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8]) {
     test_audited_security_regressions(elf, matcher_elf);
     test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf);
     test_18_mode4_netting_flip_and_adversarial_edge_cases(elf);
-    println!("[PASS] Suite 12: 18 Boring Exchange & Audited Security Regression LiteSVM Tests (Deposits, Scale-In/Out,");
-    println!("       Flips, Spreads, Funding, 3 Exit-Order Permutations, Partial+Full Liq, HLP Takeover, Cross-Margin Reuse,");
-    println!("       AMM Matcher, LP Yield, WindDown, Revival/Dirty-Init, ForceHaircut, FreezeMint, SharePool, Self-Transfer,");
-    println!("       I_m-Contained Cross-PnL Fronting, Optimistic LP NAV Anti-Arb, SweepSurplus, AllowFreeze & Mode-4 Flips!)");
+    test_19_flash_arb_crossing_limit_order_matchers(elf, limit_matcher_elf);
+    test_20_pr8_bankrupt_settlement_blocked_regression(elf, matcher_elf);
+    test_21_issue107_partial_liq_post_fee_solvency(elf);
+    test_22_issue110_self_made_market_overflow_dos_blocked(elf);
+    println!("[PASS] Suite 12: 22 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn load_elfs() -> (Vec<u8>, Vec<u8>) {
+    fn load_elfs() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let elf = std::fs::read(root.join("build/percolator.so"))
             .expect("build/percolator.so missing — run ./scripts/build-and-test.sh first");
         let matcher_elf = std::fs::read(root.join("build/matcher.so"))
             .expect("build/matcher.so missing — run ./scripts/build-and-test.sh first");
-        (elf, matcher_elf)
+        let limit_matcher_elf = std::fs::read(root.join("build/limit_matcher.so"))
+            .expect("build/limit_matcher.so missing — run ./scripts/build-and-test.sh first");
+        (elf, matcher_elf, limit_matcher_elf)
     }
 
-    #[test] fn boring_01_deposit_withdraw_roundtrip() { let (e, _) = load_elfs(); test_boring_deposit_withdraw_roundtrip(&e); }
-    #[test] fn boring_02_simple_long_short_pnl() { let (e, _) = load_elfs(); test_boring_simple_long_short_profit_and_loss(&e); }
-    #[test] fn boring_03_scale_in_and_partial_closes() { let (e, _) = load_elfs(); test_boring_scale_in_and_partial_closes(&e); }
-    #[test] fn boring_04_position_flip_long_to_short() { let (e, _) = load_elfs(); test_boring_position_flip_long_to_short(&e); }
-    #[test] fn boring_05_exec_price_bid_ask_spread() { let (e, _) = load_elfs(); test_boring_exec_price_bid_ask_spread(&e); }
-    #[test] fn boring_06_funding_rate_both_directions() { let (e, _) = load_elfs(); test_boring_funding_rate_longs_pay_shorts_and_reverse(&e); }
-    #[test] fn boring_07_exit_orders_permutations() { let (e, _) = load_elfs(); test_boring_exit_orders_permutations(&e); }
-    #[test] fn boring_08_partial_and_full_liquidation() { let (e, _) = load_elfs(); test_boring_partial_and_full_liquidation_normal(&e); }
-    #[test] fn boring_09_liquidation_takeover_hlp_style() { let (e, _) = load_elfs(); test_boring_liquidation_takeover_hlp_style(&e); }
-    #[test] fn boring_10_cross_margin_offset_and_profit_reuse() { let (e, _) = load_elfs(); test_boring_cross_margin_btc_eth_offset_and_profit_reuse(&e); }
-    #[test] fn boring_11_withdraw_margin_checks_and_freshness() { let (e, _) = load_elfs(); test_boring_withdraw_margin_checks_and_freshness(&e); }
-    #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
-    #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
-    #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
-    #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
-    #[test] fn boring_16_audited_security_regressions() { let (e, m) = load_elfs(); test_audited_security_regressions(&e, &m); }
-    #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
-    #[test] fn boring_18_mode4_netting_flip_and_adversarial_edge_cases() { let (e, _) = load_elfs(); test_18_mode4_netting_flip_and_adversarial_edge_cases(&e); }
+    #[test] fn boring_01_deposit_withdraw_roundtrip() { let (e, _, _) = load_elfs(); test_boring_deposit_withdraw_roundtrip(&e); }
+    #[test] fn boring_02_simple_long_short_pnl() { let (e, _, _) = load_elfs(); test_boring_simple_long_short_profit_and_loss(&e); }
+    #[test] fn boring_03_scale_in_and_partial_closes() { let (e, _, _) = load_elfs(); test_boring_scale_in_and_partial_closes(&e); }
+    #[test] fn boring_04_position_flip_long_to_short() { let (e, _, _) = load_elfs(); test_boring_position_flip_long_to_short(&e); }
+    #[test] fn boring_05_exec_price_bid_ask_spread() { let (e, _, _) = load_elfs(); test_boring_exec_price_bid_ask_spread(&e); }
+    #[test] fn boring_06_funding_rate_both_directions() { let (e, _, _) = load_elfs(); test_boring_funding_rate_longs_pay_shorts_and_reverse(&e); }
+    #[test] fn boring_07_exit_orders_permutations() { let (e, _, _) = load_elfs(); test_boring_exit_orders_permutations(&e); }
+    #[test] fn boring_08_partial_and_full_liquidation() { let (e, _, _) = load_elfs(); test_boring_partial_and_full_liquidation_normal(&e); }
+    #[test] fn boring_09_liquidation_takeover_hlp_style() { let (e, _, _) = load_elfs(); test_boring_liquidation_takeover_hlp_style(&e); }
+    #[test] fn boring_10_cross_margin_offset_and_profit_reuse() { let (e, _, _) = load_elfs(); test_boring_cross_margin_btc_eth_offset_and_profit_reuse(&e); }
+    #[test] fn boring_11_withdraw_margin_checks_and_freshness() { let (e, _, _) = load_elfs(); test_boring_withdraw_margin_checks_and_freshness(&e); }
+    #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m, _) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
+    #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
+    #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
+    #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
+    #[test] fn boring_16_audited_security_regressions() { let (e, m, _) = load_elfs(); test_audited_security_regressions(&e, &m); }
+    #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
+    #[test] fn boring_18_mode4_netting_flip_and_adversarial_edge_cases() { let (e, _, _) = load_elfs(); test_18_mode4_netting_flip_and_adversarial_edge_cases(&e); }
+    #[test] fn boring_19_flash_arb_crossing_limit_order_matchers() { let (e, _, lm) = load_elfs(); test_19_flash_arb_crossing_limit_order_matchers(&e, &lm); }
+    #[test] fn boring_20_pr8_bankrupt_settlement_blocked_regression() { let (e, m, _) = load_elfs(); test_20_pr8_bankrupt_settlement_blocked_regression(&e, &m); }
+    #[test] fn boring_21_issue107_partial_liq_post_fee_solvency() { let (e, _, _) = load_elfs(); test_21_issue107_partial_liq_post_fee_solvency(&e); }
+    #[test] fn boring_22_issue110_self_made_market_overflow_dos_blocked() { let (e, _, _) = load_elfs(); test_22_issue110_self_made_market_overflow_dos_blocked(&e); }
 }

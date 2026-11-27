@@ -48,7 +48,7 @@ def alphaPortfolioBySlot (s : SvmState) (fData : Ptr) : FirewallPortfolio where
 /-- A single compiled bytecode operation on a shared portfolio `fData` invoked by an adversarial
     permissionless market `mData ≠ mReal` occupying slot `slotIdx ≠ realSlot`. -/
 inductive SvmAdvStep (dData fData : Ptr) (realSlot : UInt64) : SvmState → SvmState → Prop where
-  | refreshAdv (mData : Ptr) (slotIdx curSlot shortfall : UInt64) (fh : Bool) (s s' : SvmState)
+  | refreshAdv (mData : Ptr) (slotIdx curSlot shortfall : UInt64) (fh allowBankrupt : Bool) (s s' : SvmState)
       (hsp : 64 ≤ s.stackSp.toNat)
       (hslot : slotIdx < MAX_LEGS) (hne : slotIdx ≠ realSlot)
       (hdV : regionValid dData DexOff.size) (hmV : regionValid mData MktOff.size) (hfV : regionValid fData PflOff.size)
@@ -57,7 +57,7 @@ inductive SvmAdvStep (dData fData : Ptr) (realSlot : UInt64) : SvmState → SvmS
       (hDF : regionDisjoint dData DexOff.size fData PflOff.size)
       (hMF : regionDisjoint mData MktOff.size fData PflOff.size)
       (hStock : dexStockExact s dData)
-      (hExec : settleAndRefreshLeg dData mData fData slotIdx curSlot fh s = .ok shortfall s') :
+      (hExec : settleAndRefreshLeg dData mData fData slotIdx curSlot fh allowBankrupt s = .ok shortfall s') :
       SvmAdvStep dData fData realSlot s s'
   | syncAdv (mData : Ptr) (slotIdx curSlot : UInt64) (s s' : SvmState)
       (hsp : 48 ≤ s.stackSp.toNat)
@@ -113,9 +113,9 @@ theorem svm_to_firewall_multi_market_isolation
       a.readU64 (legPtrAt fData realSlot + LegOff.lockedMm) := by
     intro a b hst
     cases hst with
-    | refreshAdv mData slotIdx curSlot sf fh _ _ hsp hslot hne hdV hmV hfV hdSt hmSt hfSt hDM hDF hMF hStock hExec =>
-      have ⟨_, _, _, hLock⟩ := settleAndRefreshLeg_preserves_stock_and_no_shielding
-        dData mData fData slotIdx curSlot fh sf a b hsp hslot hdV hmV hfV hdSt hmSt hfSt hDM hDF hMF hStock hExec
+    | refreshAdv mData slotIdx curSlot sf fh ab _ _ hsp hslot hne hdV hmV hfV hdSt hmSt hfSt hDM hDF hMF hStock hExec =>
+      have ⟨_, _, _, hLock, _⟩ := settleAndRefreshLeg_preserves_stock_and_no_shielding
+        dData mData fData slotIdx curSlot fh ab sf a b hsp hslot hdV hmV hfV hdSt hmSt hfSt hDM hDF hMF hStock hExec
       exact hLock realSlot hRealLt (Ne.symm hne)
     | syncAdv mData slotIdx curSlot _ _ hsp hslot hne hmV hfV hmSt hfSt hMF hExec =>
       have ⟨_, _, hOth⟩ := syncLegMargins_zeroes_reserved_and_preserves_frame
