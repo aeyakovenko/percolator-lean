@@ -26,6 +26,7 @@ def MAX_EXIT_WINDOW  : UInt64 := 216_000            -- maximum wind-down exit wi
 def MAX_STALENESS    : UInt64 := 9_000              -- maximum oracle staleness (~1h at 400ms/slot)
 def MAX_LEGS         : UInt64 := 8                  -- max cross-margin legs per Portfolio
 def MIN_FIRST_INS_DEPOSIT : UInt64 := 1_000_000     -- 1.0 quote unit min first LP deposit (anti-ERC4626 inflation)
+def INS_DRAW_WINDOW_SLOTS : UInt64 := 9_000         -- ~1 hour window for cumulative `maxInsDrawBps` cap (blocks #113 split drain)
 
 /-! ### Pinned Canonical SPL Token Program ID (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`) -/
 
@@ -138,7 +139,9 @@ namespace MktOff
   def windDownSlot   : UInt64 := 128 -- u64
   def exitWindow     : UInt64 := 136 -- u64
   def maxStaleness   : UInt64 := 144 -- u64
-  -- bytes 152..159: reserved zero padding (instant backed realization; legacy warmupSlots removed!)
+  -- bytes 152..159 (previously reserved zero padding): windowed cumulative `maxInsDrawBps` budget (0 ABI change!)
+  def insDrawUsedBps : UInt64 := 152 -- u16 (cumulative bps of `I_m` drawn in `insDrawWinId`, <= maxInsDrawBps)
+  def insDrawWinId   : UInt64 := 156 -- u32 (`curSlot / INS_DRAW_WINDOW_SLOTS`)
   def imBps          : UInt64 := 160 -- u64
   def mmBps          : UInt64 := 168 -- u64
   def liqFeeBps      : UInt64 := 176 -- u64

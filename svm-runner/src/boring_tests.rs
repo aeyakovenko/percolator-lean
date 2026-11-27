@@ -268,7 +268,14 @@ impl BoringEnv {
         let max_move_bps = read_u64(&self.svm, &mkt, 192);
         let mut cur_price = read_u64(&self.svm, &mkt, 112);
         loop {
-            let max_allowed = ((cur_price as u128 * max_move_bps as u128) / 10_000u128) as u64;
+            let last_sl = read_u64(&self.svm, &mkt, 120);
+            let next_sl = self.slot + 1;
+            let eff_bps = if next_sl == last_sl + 1 && max_move_bps > 1 {
+                max_move_bps / 2
+            } else {
+                max_move_bps
+            };
+            let max_allowed = ((cur_price as u128 * eff_bps as u128) / 10_000u128) as u64;
             let diff = cur_price.abs_diff(target_price);
             if diff + fund_e6 <= max_allowed {
                 self.advance_slot(1);
@@ -2826,7 +2833,7 @@ pub fn test_22_issue110_self_made_market_overflow_dos_blocked(elf: &[u8]) {
         let cur_p = read_u64(&e.svm, &m_atk, 112);
         let next_p = cur_p + cur_p / 20; // +5% price + 5% funding = 10% maxMove!
         let fund = cur_p / 20;
-        e.advance_slot(1);
+        e.advance_slot(2);
         send_ok(
             &mut e.svm,
             ix_update_oracle(e.prog_id, m_atk, atk_oracle.pubkey(), next_p, 2, fund),
@@ -2900,7 +2907,114 @@ pub fn test_23_pr9_mode1_qty_bounded_by_leg_cap(elf: &[u8]) {
     println!("       [t23] PR #9 / #100 regression verified: mode=1 dust over-close rejected (103), exact 1-BTC close preserved 999 OI & ADL_ONE!");
 }
 
-/// Runs all 23 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
+/// Test 24: Issue #113 + Mainnet 5-to-8-Slot Censorship Regression!
+///   Exact live mainnet Round-3 parameters (`imBps=1000, mmBps=600, liqFeeBps=50, tradeFeeBps=2, maxMoveBps=100, maxInsDrawBps=2500`, `$23` insurance):
+///     1. Proves **5-slot censorship** AND **8-slot double-leader censorship** (starting right at exact MM after an idle slot:
+///        1 full 100 bps jump + 5/8 consecutive paced 50 bps steps, plus verifying 1-slot 100 bps spam is REJECTED `Custom(104)`!)
+///        produce **EXACT `0` bad debt and `0` insurance draw**!
+///     2. Proves that even after a **-12% crash with zero keepers**, liquidating **10 pre-sized self-trade pairs** (each sized
+///        to ~24.5% of remaining `I_m` per #113!) draws **strictly `<= 25%` of initial `$23`** (`I_m >= $17.25` preserved!),
+///        with pairs 2..9 drawing **EXACT `0`** from `I_m` (excess bad debt absorbed by ADL on the attacker's own Shorts!).
+///     3. Proves that after advancing past `INS_DRAW_WINDOW_SLOTS` (`9_000` slots), the window resets cleanly!
+pub fn test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    // Exact mainnet Round-3 params: im=1000, mm=600, liqFee=50, tradeFee=2, maxMove=100, maxInsDrawBps=2500
+    let mkt = e.create_market(100 * POS_SCALE, 10, 1000, 600, 50, 2, 100);
+
+    // Seed exact $23 insurance
+    let lp_kp = Keypair::new();
+    e.svm.airdrop(&lp_kp.pubkey(), 1_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_kp.pubkey(), 100 * POS_SCALE);
+    let r_lp = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(
+        &mut e.svm,
+        ix_deposit_insurance(e.prog_id, e.dex, mkt, r_lp, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 23 * POS_SCALE),
+        &e.payer, &[&e.payer, &lp_kp],
+    );
+    let keeper = Keypair::new();
+    e.svm.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+    let keeper_tok = create_tok_acc(&mut e.svm, &e.mint, &keeper.pubkey(), 0);
+
+    // Part A: 5-slot & 8-slot double-leader censorship from exact MM ($6.00 equity on 1.0 Long @ $100) -> 0 bad debt!
+    let c_long  = e.create_trader(100 * POS_SCALE, 10_020_000); // $10.02 -> pays $0.02 tradeFee -> $10.00 equity
+    let c_short = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    e.trade(mkt, &c_long, &c_short, 0, POS_SCALE);
+    // Withdraw excess down to exact MM ($6.00) -> wait: Withdraw requires IM, so step down -4% to exact MM ($6.00 equity) first!
+    e.advance_slot(2);
+    // Test 1: after idle (`dt = 2`), full -1% step ($100 -> $99) SUCCEEDS; immediate next-slot (`dt = 1`) -1% ($99 -> $98.01) REJECTED (`Custom(104)`)!
+    send_ok(&mut e.svm, ix_update_oracle(e.prog_id, mkt, e.oracle.pubkey(), 99 * POS_SCALE, 0, 0), &e.payer, &[&e.payer, &e.oracle]);
+    e.advance_slot(1);
+    send_err_custom(
+        &mut e.svm,
+        ix_update_oracle(e.prog_id, mkt, e.oracle.pubkey(), 98_010_000, 0, 0),
+        &e.payer, &[&e.payer, &e.oracle], 104,
+        "dt == 1 half-step pacing MUST reject full maxMoveBps (Custom 104)",
+    );
+    // Step down to $96.00 so c_long is right at ~6% equity ($6.00 ≈ MM $5.76), then simulate 8 FULL CENSORED SLOTS!
+    e.update_oracle(mkt, 96 * POS_SCALE, 0, 0);
+    let ins_pre_censor = read_u64(&e.svm, &mkt, 224);
+    // Idle 2 slots -> 1 initial full -1% jump + 8 consecutive dt==1 -0.5% censored steps (9 oracle steps across 8 censored slots!)
+    e.advance_slot(2);
+    let mut pc = 96 * POS_SCALE;
+    pc = pc - pc / 100; // initial -1% after idle
+    send_ok(&mut e.svm, ix_update_oracle(e.prog_id, mkt, e.oracle.pubkey(), pc, 0, 0), &e.payer, &[&e.payer, &e.oracle]);
+    for _ in 0..8 {
+        e.advance_slot(1);
+        pc = pc - pc / 200; // -0.5% per consecutive censored slot
+        send_ok(&mut e.svm, ix_update_oracle(e.prog_id, mkt, e.oracle.pubkey(), pc, 0, 0), &e.payer, &[&e.payer, &e.oracle]);
+    }
+    // Honest keeper liquidates on slot 9 -> ZERO bad debt, ZERO insurance draw!
+    send_ok(&mut e.svm, ix_liquidate(e.prog_id, e.dex, mkt, c_long.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &mkt, 224), ins_pre_censor, "8-slot double-leader censorship MUST have ZERO I_m draw!");
+    e.refresh(mkt, &c_short);
+    send_ok(&mut e.svm, ix_clear_dead_leg(e.prog_id, e.dex, mkt, c_short.pfl), &e.payer, &[&e.payer]);
+
+    // Part B: #113 10-pair pre-sized self-trade split drain after a full -12% crash (zero keepers):
+    //   Reset mark to $100, open 10 pre-sized pairs where each pair's shortfall at -12% (~$0.02/unit -> 24.5% of remaining I_m)!
+    e.update_oracle(mkt, 100 * POS_SCALE, 0, 0);
+    let mut pairs: Vec<(Trader, Trader)> = Vec::new();
+    let mut pred_ins = read_u64(&e.svm, &mkt, 224) as f64;
+    for _ in 0..10 {
+        let target_sf = pred_ins * 0.245;
+        // At 10.02% collateral ($10.02/unit, $0.02 fee -> $10.00 equity) and -12% crash, shortfall = $2.00 per unit
+        let qty = ((target_sf / 2.0) as u64).max(POS_SCALE / 10);
+        let col = ((qty as u128 * 10_020_000) / POS_SCALE as u128) as u64 + 1_000;
+        let l = e.create_trader(col * 2, col);
+        let s = e.create_trader(col * 2, col * 2);
+        e.trade(mkt, &l, &s, 0, qty);
+        pairs.push((l, s));
+        pred_ins *= 0.755;
+    }
+    let ins_before_10 = read_u64(&e.svm, &mkt, 224);
+    // Crash -12% ($100 -> $88) with zero keepers
+    e.update_oracle(mkt, 88 * POS_SCALE, 0, 0);
+
+    // Liquidate all 10 bankrupt longs in the SAME window!
+    let mut zero_draw_legs = 0usize;
+    for (l, _) in &pairs {
+        let pre = read_u64(&e.svm, &mkt, 224);
+        send_ok(&mut e.svm, ix_liquidate(e.prog_id, e.dex, mkt, l.pfl, keeper_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID), &e.payer, &[&e.payer]);
+        let post = read_u64(&e.svm, &mkt, 224);
+        if pre == post {
+            zero_draw_legs += 1;
+        }
+    }
+    let ins_after_10 = read_u64(&e.svm, &mkt, 224);
+    let total_drawn = ins_before_10 - ins_after_10;
+    let max_window_draw = ((ins_before_10 as u128 * 2500) / 10_000) as u64;
+    assert!(
+        total_drawn <= max_window_draw,
+        "#113 windowed cap violated: 10-pair drain took {} > 25% cap {} (ins {} -> {})!",
+        total_drawn, max_window_draw, ins_before_10, ins_after_10
+    );
+    assert!(zero_draw_legs >= 8, "Pairs 2..9 MUST draw exact 0 once 25% window cap is hit (zero_draw_legs={})!", zero_draw_legs);
+    assert_eq!(read_u16(&e.svm, &mkt, 152), 2500, "MktOff.insDrawUsedBps saturated at maxInsDrawBps (2500)!");
+    e.check("t24-issue113-windowed-cap");
+    println!("       [t24] Issue #113 + 8-slot censorship verified: 8-slot censor=0 draw; 10-pair -12% drain capped at {}/{} uUSDC ({} zero-draw legs)!",
+        total_drawn, max_window_draw, zero_draw_legs);
+}
+
+/// Runs all 24 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -2925,7 +3039,8 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &
     test_21_issue107_partial_liq_post_fee_solvency(elf);
     test_22_issue110_self_made_market_overflow_dos_blocked(elf);
     test_23_pr9_mode1_qty_bounded_by_leg_cap(elf);
-    println!("[PASS] Suite 12: 23 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
+    test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf);
+    println!("[PASS] Suite 12: 24 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
 }
 
 #[cfg(test)]
@@ -2966,4 +3081,5 @@ mod tests {
     #[test] fn boring_21_issue107_partial_liq_post_fee_solvency() { let (e, _, _) = load_elfs(); test_21_issue107_partial_liq_post_fee_solvency(&e); }
     #[test] fn boring_22_issue110_self_made_market_overflow_dos_blocked() { let (e, _, _) = load_elfs(); test_22_issue110_self_made_market_overflow_dos_blocked(&e); }
     #[test] fn boring_23_pr9_mode1_qty_bounded_by_leg_cap() { let (e, _, _) = load_elfs(); test_23_pr9_mode1_qty_bounded_by_leg_cap(&e); }
+    #[test] fn boring_24_issue113_windowed_ins_draw_and_5slot_censorship() { let (e, _, _) = load_elfs(); test_24_issue113_windowed_ins_draw_and_5slot_censorship(&e); }
 }

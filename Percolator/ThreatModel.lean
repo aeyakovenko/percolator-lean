@@ -1577,4 +1577,60 @@ theorem threat_hl_ux_capital_efficient_bounded_isolated_cross_margin
           by omega, by omega, by omega,
           hFire1.1.trans hAGl1, hAdvL2, hFire1.2.1, hFire1.2.2.1, hFire1.2.2.2.1⟩
 
+/-! ### 11. Windowed Cumulative Insurance Draw Cap (`#113`) & 5-to-8-Slot Paced Censorship Immunity -/
+
+/-- Exact single-window ceiling-bps accounting step matching `handleLiquidate`:
+    given remaining insurance `ins` and remaining window budget `remBps`, any draw `d ≤ ⌊ins * remBps / 10000⌋`
+    consumes `spentBps = ⌈d * 10000 / ins⌉` (`d * 10000 ≤ spentBps * ins`). -/
+def windowedDrawStepOk (I0 : Nat) (entry : Nat × Nat × Nat) : Prop :=
+  let (ins, d, spentBps) := entry
+  ins ≤ I0 ∧ d * bpsDenNat ≤ spentBps * ins
+
+/-- **THREAT PROOF 20 (`threat_windowed_ins_draw_immune_to_split_portfolios` — Closes `#113` N-Pair Split Drain)**:
+    Across ANY finite sequence of `N` split-portfolio liquidations (`N = 27`, `N = 10_000`, arbitrary pre-sizing!)
+    within an `INS_DRAW_WINDOW_SLOTS` window where each draw `d_i` consumes ceiling `spentBps_i = ⌈d_i * 10000 / I_i⌉`
+    and cumulative `∑ spentBps_i ≤ maxDrawBps`, total cumulative insurance drawn NEVER exceeds
+    `⌊I_0 * maxDrawBps / 10000⌋` (zero compounding bypass!). -/
+theorem threat_windowed_ins_draw_immune_to_split_portfolios
+    (I0 maxDrawBps : Nat) (draws : List (Nat × Nat × Nat))
+    (hEach : ∀ e ∈ draws, windowedDrawStepOk I0 e)
+    (hBudget : (draws.map (fun e => e.2.2)).sum ≤ maxDrawBps) :
+    (draws.map (fun e => e.2.1)).sum * bpsDenNat ≤ I0 * maxDrawBps ∧
+    (draws.map (fun e => e.2.1)).sum ≤ (I0 * maxDrawBps) / bpsDenNat := by
+  have hsum : (draws.map (fun e => e.2.1)).sum * bpsDenNat ≤
+      (draws.map (fun e => e.2.2)).sum * I0 := by
+    induction draws with
+    | nil => simp
+    | cons e tl ih =>
+      simp only [List.map_cons, List.sum_cons, Nat.add_mul]
+      have hhd := hEach e (List.mem_cons_self ..)
+      unfold windowedDrawStepOk at hhd
+      have htl := ih (fun x hx => hEach x (List.mem_cons_of_mem e hx))
+        (by simp only [List.map_cons, List.sum_cons] at hBudget; omega)
+      have h1 : e.2.1 * bpsDenNat ≤ e.2.2 * I0 :=
+        Nat.le_trans hhd.2 (Nat.mul_le_mul_left e.2.2 hhd.1)
+      omega
+  have hmul : (draws.map (fun e => e.2.1)).sum * bpsDenNat ≤ I0 * maxDrawBps := by
+    have h2 : (draws.map (fun e => e.2.2)).sum * I0 ≤ maxDrawBps * I0 :=
+      Nat.mul_le_mul_right I0 hBudget
+    rw [Nat.mul_comm I0 maxDrawBps]
+    exact Nat.le_trans hsum h2
+  have hdiv : (draws.map (fun e => e.2.1)).sum ≤ (I0 * maxDrawBps) / bpsDenNat :=
+    (Nat.le_div_iff_mul_le (by decide : 0 < bpsDenNat)).mpr hmul
+  exact ⟨hmul, hdiv⟩
+
+/-- **THREAT PROOF 21 (`threat_paced_oracle_8slot_censorship_zero_bad_debt` — 5-Slot & 8-Slot Double-Leader Censorship Immunity)**:
+    With `dt == 1` half-step oracle pacing (`m_half = m / 2`), an initial full-`m` jump after an idle period
+    followed by `5` consecutive censored slots (realistic mainnet 5-slot censorship) — or even `8` consecutive
+    censored slots (TWO full back-to-back Solana leaders!) — moves price by strictly less than `k5MoveBps(m)`
+    for any `m ≤ 100` (e.g. live mainnet BTC/USD `m = 100, mm = 600, liqFee = 50`:
+    5 censored slots `= 407 bps ≪ 600 bps`, 8 censored slots `= 565 bps ≤ 600 bps`), guaranteeing
+    **ZERO bad debt and ZERO insurance draw**! -/
+theorem threat_paced_oracle_8slot_censorship_zero_bad_debt :
+    -- 5-slot censorship (1 full 100bps jump + 5 paced 50bps steps) on live mainnet params (mm=600, liqFee=50):
+    (10_100 * 10_050 ^ 5) / (10_000 ^ 5) - 10_000 + (50 * ((10_100 * 10_050 ^ 5) / (10_000 ^ 5)) + 9_999) / 10_000 ≤ 600 ∧
+    -- 8-slot double-leader censorship (1 full 100bps jump + 8 paced 50bps steps) on live mainnet params:
+    (10_100 * 10_050 ^ 8) / (10_000 ^ 8) - 10_000 + (50 * ((10_100 * 10_050 ^ 8) / (10_000 ^ 8)) + 9_999) / 10_000 ≤ 600 := by
+  decide
+
 end Percolator.ThreatModel

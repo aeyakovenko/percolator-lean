@@ -678,7 +678,11 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   let mData := AccountView.dataPtr mkt
   SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
   let oldP ← loadU64 mData MktOff.markPrice
-  let maxAllowed ← mulDiv64 oldP (← loadU64 mData MktOff.maxMoveBps) BPS_DEN
+  let lastSlot ← loadU64 mData MktOff.lastOracleSlot
+  let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
+  let effMaxMove :=
+    if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+  let maxAllowed ← mulDiv64 oldP effMaxMove BPS_DEN
 
   -- Clamp price step smoothly toward `feedPrice`
   let (newP, step) : UInt64 × UInt64 :=

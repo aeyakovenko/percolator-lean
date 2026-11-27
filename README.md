@@ -11,19 +11,19 @@ It achieves **full cross-margin capital efficiency on healthy markets** (hedged 
 The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/Program.lean)) plus **5 formally verified composable external programs** that integrate via CPI without bloating or modifying the core ABI:
 - **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`6,200 B`) — zero-signer-delegation CPI-Out PropAMM supporting single- and multi-market batch fills (`k ∈ [1..8]`) with market allowlist pinning, spread + inventory-impact quoting, and 0 custody.
 - **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (`13,488 B`) — **zero-ABI-change Hyperliquid-parity personal orderbook** (`864 B` `LimitBookCtx`, 8 independent order slots across any markets) bound via `SetPortfolioMatcher` + `TradeWithMatcher` with `Sysvar1nstructions` caller auth (`LErr.wrongCaller = 302`). Supports all 13 HL modes: multi-order ladders, GTC, GTD expiry, ALO Post-Only, FOK, Reduce-Only, Price Improvement, Stop-Loss Market/Limit, Take-Profit Market/Limit, Trailing Stop (+ permissionless `Op 5 CrankTrailing`), TWAP Slicer, atomic linked OCO (`ocoLink ∈ 0..7`), Multi-Market Batch Fills (`k ∈ [1..8]`), and 1-tx crossing-order flash-arb clearing (`15,070 CU`, 0 maker sigs).
-- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`18,920 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode**, with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence, and on-chain premium funding.
+- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`18,984 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode**, with pinned feed owners/IDs, confidence & staleness checks, smooth multi-slot auto-clamped convergence (in lockstep with core `dt == 1` half-step pacing), and on-chain premium funding.
 - **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (`17,384 B`) — permissionless LP share vault owning a PDA `Portfolio` for zero-ADL liquidation takeovers (`Liquidate mode=1`) and allowlist-pinned PropAMM market-making with anti-ERC-4626-inflation first-deposit locking and NAV non-dilution proofs.
 - **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (`20,584 B`) — permissionless per-market Gavel $xy=k$ uniform-price batch buy-and-burn module supporting SPL Token, Token-2022, and wSOL with strict 5th-bucket (`F_tot`) isolation and anti-rate-collapse reserve-rate floor (`MIN_RATE_E6 = 1_000`).
 
 | Program | ELF `.so` Size (sBPF v3) | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,144 B** | 11,601 | 784 B | 0 B | **235 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs` |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,576 B** | 11,655 | 784 B | 0 B | **237 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs` |
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** (CPI-Out PropAMM) | **6,200 B** | 733 | 64 B | 0 B | **7 theorems** (layout, ask/bid bounds, `maxMove` clamp, LP-favorable spread) |
 | **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (HL Orderbook) | **13,488 B** | 1,644 | 280 B | 0 B | **7 theorems** (`limit_book_layout_valid`, `limit_fill_conserves_remaining`, `oco_sync_cancels_partner`, `twap_slice_bounded`, `alo_post_only_passive`, `stop_and_tp_trigger_sound`, `trailing_watermark_monotone`) |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Oracle Bridge) | **18,920 B** | 2,323 | 552 B | 0 B | **8 theorems** (clamp + funding bounds, OCR2 ring-buffer, E6 scaling, 2-leg ratio, EWMA bounds/fixed-point/refinement) |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Oracle Bridge) | **18,984 B** | 2,331 | 552 B | 0 B | **8 theorems** (clamp + funding bounds, OCR2 ring-buffer, E6 scaling, 2-leg ratio, EWMA bounds/fixed-point/refinement) |
 | **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (HLP Takeover Vault) | **17,384 B** | 2,131 | 864 B | 0 B | **7 theorems** (layout, anti-inflation lock, NAV non-dilution, withdrawal solvency, allowlist subset anti-rug) |
 | **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (Buy & Burn) | **20,584 B** | 2,531 | 704 B | 0 B | **11 theorems** (layout, $xy=k$ invariant, batch solvency, quiet-epoch cap, spam monotonicity, anti-collapse healthy/dust/empty rate proofs, exact fee-split conservation) |
-| *Total* | *6 production ELFs* | — | — | **0 B** | **275 public theorems** (324 incl. private lemmas), `0 sorry`, `0` custom axioms |
+| *Total* | *6 production ELFs* | — | — | **0 B** | **277 public theorems** (326 incl. private lemmas), `0 sorry`, `0` custom axioms |
 
 ---
 
@@ -39,7 +39,7 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
                  └──────────┐  CPI-Out (`MRET`) ┌──────┘
                             ▼  TradeWithMatcher ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│           percolator-lean Core (92,592 B · 24 ops · sBPF v3 · 0 heap)  │
+│           percolator-lean Core (93,576 B · 24 ops · sBPF v3 · 0 heap)  │
 │ • Realizable 8-Leg Cross-Margin     • Per-Leg `lockedMm` Firewall      │
 │ • 5-Bucket Exact C+I+R+S+F = V      • I_m-Contained Cross-PnL Fronting │
 │ • Mode-4 Atomic Netting / Flip      • K+1=5 Compounded Oracle Envelope │
@@ -86,7 +86,8 @@ Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **ne
 - **No silent bad-debt write-offs outside `Liquidate` (`#109` / PR #8):** `settleAndRefreshLeg` enforces `allowBankrupt = false` on every non-liquidation path (`RefreshLeg`, `Trade` `mode=0..4`, `TradeWithMatcher`, and `Liquidate` takeover liquidator), rejecting any `shortfall > 0` with `PErr.insufficientMargin` (`Custom(107)`) so `Mkt.insFronted` can never be silently written off without running the liquidation waterfall.
 - **Anti-selective-liquidation without 2-bankrupt-leg deadlock (`#109` / `#110`):** `Liquidate` enforces `checkAllLegsFreshLoop` (`leg.lastRefreshSlot == curSlot` across all active legs) whenever the target leg is solvent (`shortfall == 0 && (freeCap > 0 || legLock > 0)`), protecting net-healthy hedged spreads from selective single-leg liquidation while allowing any genuinely bankrupt leg to liquidate immediately without another bankrupt/stale leg holding a veto.
 - **Post-`liqFee` partial-liquidation solvency (`#107`):** Any partial liquidation (`remRaw > 0`) enforces `remEff > 0 && postAvail > 0 && postEq >= remMm && remMm >= minMm` (`PErr.invalidParams` / `Custom(103)`), where `postAvail = availCap - liqFee` and `postEq = postAvail + posPnl` — eliminating zero-capital post-fee zombie legs and dust-notional unit mismatches.
-- **Exact `K+1=5` compounded oracle envelope:** `CreateMarket` enforces exact 5-step compounding `k5MoveBps + liqAtP5 <= mmBps` (`threat_k5_compounded_bound_exact`, `threat_k5_liqFee_at_p5_zero_bad_debt`), preventing multi-slot leader-censorship bad debt across `K = 4` censored slots.
+- **Exact `K+1=5` compounded oracle envelope + `dt == 1` half-step pacing (5–8 slot censorship immunity):** `CreateMarket` enforces exact 5-step compounding `k5MoveBps + liqAtP5 <= mmBps` (`threat_k5_compounded_bound_exact`, `threat_k5_liqFee_at_p5_zero_bad_debt`), and `UpdateOracle` / `OracleAdapter.Crank` automatically halve consecutive-slot (`dt == 1`) moves to `maxMoveBps / 2` while keeping full `maxMoveBps` after idle slots (`dt >= 2`) — guaranteeing **0 bad debt across both 5-slot and 8-slot double-leader censorship** (`threat_paced_oracle_8slot_censorship_zero_bad_debt`).
+- **Windowed cumulative `maxInsDrawBps` cap (`#113` split-portfolio immunity):** `Liquidate` tracks cumulative bps drawn across all liquidations in each `INS_DRAW_WINDOW_SLOTS = 9,000` (~1h) window (`MktOff.insDrawUsedBps` / `insDrawWinId` in existing 400 B `Market` padding bytes `152..159`, zero ABI change), charging ceiling `ceil(insDraw * 10_000 / ins)` (`>= 1` bps per nonzero draw) so splitting positions across `N` portfolios (`N = 27`, `N = 10,000`) can never bypass `maxInsDrawBps` (`threat_windowed_ins_draw_immune_to_split_portfolios`).
 
 ### 2.4 Fair Liquidations, Atomic Flip (`mode=4`), Post-ADL Recovery & Bounded Lifecycle
 
@@ -158,7 +159,7 @@ Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **ne
 
 ## 6. Verification & Benchmarks (LiteSVM `0.18.2` / Agave `4.3.2`, sBPF v3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **275 public Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **23 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
+See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **277 public Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **24 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
 
 ### Worst-Case 8-Leg / 16-Leg CU & Legacy Wire-MTU Benchmarks (Suite 11)
 
@@ -189,7 +190,7 @@ See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **275 public Lean 4
 9. **Suite 9 — External CPI (`OracleAdapter` Pyth/CL/SB/Ratio/EWMA + `Matcher` + Atomic Crank+LP Bundle + `K=4` Censored Liquidation)**.
 10. **Suite 10 — Core Hardening & Partial Permissionless Takeover (`4,856 CU`, gradual fee `< max`, 0 ADL)**.
 11. **Suite 11 — Worst-Case 8-Leg & 16-Leg CU/MTU Exhaustion + Anti-Selective-Liquidation + Post-ADL Recovery + Position Hand-Off**.
-12. **Suite 12 — 23 Functional, Security & HL-Parity Limit-Order Tests ([`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs))**:
+12. **Suite 12 — 24 Functional, Security & HL-Parity Limit-Order Tests ([`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs))**:
     - `t01`–`t14`: Deposit/withdraw/reclaim, Long/Short PnL + fees, scale-in & partial closes, position flips, bid/ask spreads, bidirectional funding, 3 exit-order permutations, partial/full liqs, HLP takeovers, cross-margin BTC+ETH offset, margin/freshness guards, AMM fills, Insurance LP yield & redemption, full wind-down lifecycle.
     - `t15`–`t18`: Same-tx account revival / dirty-buffer init / oversized-account / share-coherence, owner-gated `forceHaircut`, freeze-authority flag, `I_m`-fronting & LP NAV sweep, `mode=4` atomic netting/flip edge cases.
     - **`t19` (`test_19_flash_arb_crossing_limit_order_matchers`)**: Full **13-mode Hyperliquid `LimitMatcher`** suite (GTC, GTD, ALO Post-Only, FOK, Reduce-Only, Price-Improve, SL Market/Limit, TP Market/Limit, Trailing Stop + `CrankTrailing`, TWAP Slicer, linked OCO, Multi-Market Batch Fills, `Sysvar1nstructions` grief-rejection, and 1-tx crossing flash-arb in `15,070 CU`).
@@ -197,6 +198,7 @@ See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **275 public Lean 4
     - **`t21` (`test_21_issue107_partial_liq_post_fee_solvency`)**: Repro of `#107` — rejects partial liquidations leaving `postAvail == 0` or `postEq < remMm` (`Custom(103)`), while full liquidation closes cleanly with `0` `I_m` draw.
     - **`t22` (`test_22_issue110_self_made_market_overflow_dos_blocked`)**: Repro of `#110` + `#109` 2-bankrupt-leg deadlock — self-made market + bankrupt BTC both liquidate cleanly without overflow or deadlock.
     - **`t23` (`test_23_pr9_mode1_qty_bounded_by_leg_cap`)**: Repro of PR #9 / `#100` — rejects dust `Trade(mode=1)` over-closing `qty > legCloseCap` (`Custom(103)`), preserving whale OI & `ADL_ONE` (paired with Suite 9 `OracleAdapter` funding-guard verification and Suite 13 `#111` `RewardModule` anti-rate-collapse verification).
+    - **`t24` (`test_24_issue113_windowed_ins_draw_and_5slot_censorship`)**: Repro of `#113` + 5-to-8-slot mainnet censorship — rejects consecutive `dt == 1` full-`maxMoveBps` ticks (`Custom(104)`), proves 8-slot double-leader censorship produces `0` `I_m` draw, and proves 10 pre-sized split-portfolio self-trade liquidations after a `-12%` crash are strictly capped at `<= 25%` cumulative `I_m` draw per `9,000`-slot window (`>= 8` zero-draw legs, `insDrawUsedBps == 2500`).
 13. **Suite 13 — Gavel $xy=k$ Uniform-Price Batch Reward Modules**: 8-leg user × 8 unique modules (6× SPL + Token-2022 + wSOL), R1–R6 verified (`settle max 3,375 CU`, `claim max 2,272 CU`).
 14. **Suite 14 — Unified Single/Multi-Market CPI-Out PropAMM**: 0 signer delegation, 1-CPI `k=2` & `k=5` mixed Long/Short hedged discount, 12 attacks blocked (`evil_matcher.so`).
 15. **Suite 15 — Atomic Position Flip (`mode=4`) + External `HlpVault`**: Direct flip `5,090 CU`, `k=3` batch flip `22,304 CU`, HLP vault takeovers with 0 ADL and 0 rug.
@@ -208,11 +210,11 @@ See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **275 public Lean 4
 ## 7. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (275 public theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (277 public theorems, 0 sorry, 0 custom axioms),
 # compile all 7 sBPF v3 .so binaries, and execute all 17 LiteSVM suites:
 ./scripts/build-and-test.sh
 
-# Run all 23 boring exchange, security & HL limit-order LiteSVM tests individually:
+# Run all 24 boring exchange, security & HL limit-order LiteSVM tests individually:
 cargo test --manifest-path svm-runner/Cargo.toml --release
 ```
 

@@ -778,7 +778,13 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
 
   let oldPrice ← loadU64 mData MktOff.markPrice
   let diff := if newPrice >= oldPrice then newPrice - oldPrice else oldPrice - newPrice
-  let maxAllowed ← mulDiv64 oldPrice (← loadU64 mData MktOff.maxMoveBps) BPS_DEN
+  -- Half-step pacing on consecutive 1-slot updates (`dt == 1`): doubles worst-case censorship
+  -- resistance across BOTH existing live markets & new markets (5-slot & 8-slot double-leader
+  -- censorship stay strictly within `mmBps` with 0 bad debt, while `dt >= 2` keeps full `maxMoveBps`!).
+  let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
+  let effMaxMove :=
+    if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+  let maxAllowed ← mulDiv64 oldPrice effMaxMove BPS_DEN
   SolanaM.require ((← checkedAdd64 diff fundE6) <= maxAllowed) PErr.oracleClamp
 
   -- Gap #4B Fix (Exact Asymmetric-ADL Zero-Sum Oracle Settlement):
@@ -1525,14 +1531,26 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
     tokenTransferCheckedSigned tokProg vaultPda mint liqTok vaultPda liqFee dec
       TAG_DEX_VAULT (AccountView.keyPtr dex) bump
 
-  -- Capped draw from THIS market's isolated insurance `I_m` into `R_m` ONLY when BOTH
-  -- `freeCap == 0` AND `legLock == 0` (guaranteed by `settleAndRefreshLeg`; explicit defense-in-depth!).
+  -- Windowed cumulative draw cap from THIS market's isolated insurance `I_m` into `R_m` ONLY when BOTH
+  -- `freeCap == 0` AND `legLock == 0`: enforces `∑ spentBps <= maxInsDrawBps` across ALL liquidations
+  -- in any `INS_DRAW_WINDOW_SLOTS` (~1h) window using ceiling bps (blocks #113 N-pair split drains!).
   if shortfall > 0 && freeCap == 0 && legLock == 0 then
     let ins ← loadU64 mData MktOff.insurance
-    let maxDraw ← mulDiv64 ins (← loadU64 mData MktOff.maxInsDrawBps) BPS_DEN
+    let maxDrawBps ← loadU64 mData MktOff.maxInsDrawBps
+    let winId32 := (curSlot / INS_DRAW_WINDOW_SLOTS).toUInt32
+    let storedWin ← loadU32 mData MktOff.insDrawWinId
+    let usedBps0 ← loadU16 mData MktOff.insDrawUsedBps
+    let usedBps := if storedWin == winId32 then usedBps0.toUInt64 else 0
+    let remBps := if maxDrawBps > usedBps then maxDrawBps - usedBps else 0
+    let maxDraw ← mulDiv64 ins remBps BPS_DEN
     let draw1 := if shortfall < maxDraw then shortfall else maxDraw
     let insDraw := if draw1 < ins then draw1 else ins
     if insDraw > 0 then
+      let spentBps ← mulDiv64Ceil insDraw BPS_DEN ins
+      let nextUsed0 := usedBps + spentBps
+      let nextUsed := if nextUsed0 < maxDrawBps then nextUsed0 else maxDrawBps
+      storeU16 mData MktOff.insDrawUsedBps nextUsed.toUInt16
+      storeU32 mData MktOff.insDrawWinId   winId32
       subU64At mData MktOff.insurance      insDraw
       subU64At dData DexOff.totalInsurance insDraw
       addU64At mData MktOff.realizedPool   insDraw

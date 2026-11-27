@@ -71,6 +71,11 @@ fn read_u8(svm: &LiteSVM, acc: &Address, off: usize) -> u8 {
     a.data[off]
 }
 
+fn read_u16(svm: &LiteSVM, acc: &Address, off: usize) -> u16 {
+    let a = svm.get_account(acc).expect("acc missing");
+    u16::from_le_bytes(a.data[off..off + 2].try_into().unwrap())
+}
+
 fn pfl_free_capital(svm: &LiteSVM, pfl: &Address) -> u64 {
     read_u64(svm, pfl, 88)
 }
@@ -1002,7 +1007,9 @@ fn step_oracle(
         assert!(guard < 400, "step_oracle did not converge: cur={} target={}", cur, target_price);
         let next_slot = get_slot(svm) + 1;
         set_slot(svm, next_slot);
-        let max_step = (((cur as u128 * max_move_bps as u128) / 10_000) as u64).max(1);
+        let last_sl = read_u64(svm, &mkt, 120);
+        let eff_bps = if next_slot == last_sl + 1 && max_move_bps > 1 { max_move_bps / 2 } else { max_move_bps };
+        let max_step = (((cur as u128 * eff_bps as u128) / 10_000) as u64).max(1);
         let next_p = if target_price > cur {
             cur.saturating_add(max_step).min(target_price)
         } else {
@@ -1031,12 +1038,16 @@ fn step_two_oracles(
         let next_slot = get_slot(svm) + 1;
         set_slot(svm, next_slot);
         if c1 != target_price {
-            let ms = (((c1 as u128 * bps1 as u128) / 10_000) as u64).max(1);
+            let l1 = read_u64(svm, &mkt1, 120);
+            let eb1 = if next_slot == l1 + 1 && bps1 > 1 { bps1 / 2 } else { bps1 };
+            let ms = (((c1 as u128 * eb1 as u128) / 10_000) as u64).max(1);
             c1 = if target_price > c1 { c1.saturating_add(ms).min(target_price) } else { c1.saturating_sub(ms).max(target_price) };
             last_cu = send_ok(svm, ix_update_oracle(prog, mkt1, orc1.pubkey(), c1, 0, 0), payer, &[payer, orc1]);
         }
         if c2 != target_price {
-            let ms = (((c2 as u128 * bps2 as u128) / 10_000) as u64).max(1);
+            let l2 = read_u64(svm, &mkt2, 120);
+            let eb2 = if next_slot == l2 + 1 && bps2 > 1 { bps2 / 2 } else { bps2 };
+            let ms = (((c2 as u128 * eb2 as u128) / 10_000) as u64).max(1);
             c2 = if target_price > c2 { c2.saturating_add(ms).min(target_price) } else { c2.saturating_sub(ms).max(target_price) };
             send_ok(svm, ix_update_oracle(prog, mkt2, orc2.pubkey(), c2, 0, 0), payer, &[payer, orc2]);
         }
@@ -1976,7 +1987,7 @@ fn main() {
     // MUST succeed and set `oracleAuth == lp` cleanly (NOT corrupt `oracleAuth` with instruction bytes!)
     send_ok(&mut svm, ix_update_market_auth(prog_id, comp_mkt, lp.pubkey(), 1, lp.pubkey()), &payer, &[&payer, &lp]);
     send_ok(&mut svm, ix_update_market_auth(prog_id, comp_mkt, lp.pubkey(), 1, comp_orc2.pubkey()), &payer, &[&payer, &lp]);
-    let s7_orc = get_slot(&svm) + 1;
+    let s7_orc = get_slot(&svm) + 2;
     set_slot(&mut svm, s7_orc);
     send_err(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc1.pubkey(), 100_700_000, 0, 0), &payer, &[&payer, &comp_orc1], "Old oracle rejected after rotation");
     send_ok(&mut svm, ix_update_oracle(prog_id, comp_mkt, comp_orc2.pubkey(), 100_700_000, 0, 0), &payer, &[&payer, &comp_orc2]);
@@ -2357,7 +2368,7 @@ fn main() {
     let k_long_pre_crank = read_u64(&svm, &comp_mkt2, 304);
     let mut cu_crank = 0u64;
     for step in 1..=4u64 {
-        let sl = s0 + 20 + step;
+        let sl = s0 + 20 + step * 2;
         set_slot(&mut svm, sl);
         write_feed(&mut svm, 115 * POS_SCALE, 50_000, sl);
         cu_crank = send_ok_assert_log(&mut svm, ix_crank(), &payer, &[&payer], "Program log: 0x1,");
@@ -2437,14 +2448,14 @@ fn main() {
         AccountMeta::new_readonly(pyth_feed, false), AccountMeta::new_readonly(pyth_pda, false),
         AccountMeta::new_readonly(prog_id, false),
     ], data: vec![1] };
-    let mut c1: Clock = svm.get_sysvar(); c1.slot = s0 + 31; c1.unix_timestamp = 1_750_000_005; svm.set_sysvar(&c1);
-    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 31, 0), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let mut c1: Clock = svm.get_sysvar(); c1.slot = s0 + 32; c1.unix_timestamp = 1_750_000_005; svm.set_sysvar(&c1);
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 32, 0), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 304, "Pyth rejects VerificationLevel::Partial");
-    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xCDu8; 32], 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xCDu8; 32], 10_300_000_000, 5_000_000, -8, 1_750_000_000, s0 + 32, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 305, "Pyth rejects mismatched feed_id");
-    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_749_999_900, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_749_999_900, s0 + 32, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_err_custom(&mut svm, ix_pyth_crank(), &payer, &[&payer], 300, "Pyth rejects stale publish_time");
-    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_004, s0 + 31, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(pyth_feed, Account { lamports: 10_000_000, data: make_pyth_v2(pyth_fid, 10_300_000_000, 5_000_000, -8, 1_750_000_004, s0 + 32, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     let cu_pyth = send_ok_assert_log(&mut svm, ix_pyth_crank(), &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &pyth_mkt, 112), 103 * POS_SCALE, "Pyth V2 parsed $103.00 (expo -8 -> E6)!");
 
@@ -2453,7 +2464,7 @@ fn main() {
     let cl_mkt = create_prog_acc(&mut svm, &prog_id, MKT_SIZE);
     let cl_adp = create_prog_acc(&mut svm, &adapter_prog, 352);
     let (cl_pda, cl_bump) = Address::find_program_address(&[b"orac", cl_adp.as_ref()], &adapter_prog);
-    svm.set_account(cl_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, s0 + 31, 10_250_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(cl_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 0, s0 + 32, 10_250_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok(&mut svm, ix_create_market(prog_id, dex, cl_mkt, mint, cl_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 3000, 2500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut cl_init = vec![0u8; 28];
     cl_init[0] = 0; cl_init[1] = cl_bump; cl_init[2] = 2;
@@ -2464,7 +2475,7 @@ fn main() {
         AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(cl_mkt, false),
         AccountMeta::new_readonly(cl_feed, false),
     ], data: cl_init }, &payer, &[&payer, &lp]);
-    let mut c2: Clock = svm.get_sysvar(); c2.slot = s0 + 32; c2.unix_timestamp = 1_750_000_006; svm.set_sysvar(&c2);
+    let mut c2: Clock = svm.get_sysvar(); c2.slot = s0 + 34; c2.unix_timestamp = 1_750_000_006; svm.set_sysvar(&c2);
     let cu_cl = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
         AccountMeta::new_readonly(cl_adp, false), AccountMeta::new(cl_mkt, false),
         AccountMeta::new_readonly(cl_feed, false), AccountMeta::new_readonly(cl_pda, false),
@@ -2479,7 +2490,7 @@ fn main() {
     let (sb_pda, sb_bump) = Address::find_program_address(&[b"orac", sb_adp.as_ref()], &adapter_prog);
     let sb_val: i128 = 104i128 * 1_000_000_000_000_000_000i128;
     let sb_std: i128 = 100_000_000_000_000_000i128;
-    svm.set_account(sb_feed, Account { lamports: 10_000_000, data: make_switchboard(sb_val, sb_std, 5, s0 + 32), owner: sb_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sb_feed, Account { lamports: 10_000_000, data: make_switchboard(sb_val, sb_std, 5, s0 + 34), owner: sb_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok(&mut svm, ix_create_market(prog_id, dex, sb_mkt, mint, sb_pda, lp.pubkey(), lp_tok, fee_vault, 100 * POS_SCALE, 10, 50, 0, 3000, 2500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut sb_init = vec![0u8; 28];
     sb_init[0] = 0; sb_init[1] = sb_bump; sb_init[2] = 3;
@@ -2490,7 +2501,7 @@ fn main() {
         AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(sb_mkt, false),
         AccountMeta::new_readonly(sb_feed, false),
     ], data: sb_init }, &payer, &[&payer, &lp]);
-    let mut c3: Clock = svm.get_sysvar(); c3.slot = s0 + 33; c3.unix_timestamp = 1_750_000_007; svm.set_sysvar(&c3);
+    let mut c3: Clock = svm.get_sysvar(); c3.slot = s0 + 36; c3.unix_timestamp = 1_750_000_007; svm.set_sysvar(&c3);
     let cu_sb = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
         AccountMeta::new_readonly(sb_adp, false), AccountMeta::new(sb_mkt, false),
         AccountMeta::new_readonly(sb_feed, false), AccountMeta::new_readonly(sb_pda, false),
@@ -2505,8 +2516,8 @@ fn main() {
     let stoxx_feed = Keypair::new().pubkey();
     let sol_feed   = Keypair::new().pubkey();
     let stoxx_fid  = [0x55u8; 32];
-    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 50_000_000_000, 10_000_000, -8, 1_750_000_007, s0 + 33, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 33, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 50_000_000_000, 10_000_000, -8, 1_750_000_007, s0 + 36, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 36, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok(&mut svm, ix_create_market(prog_id, dex, rat_mkt, mint, rat_pda, lp.pubkey(), lp_tok, fee_vault, 3_950_000, 10, 50, 0, 3000, 2500, 100, 0, 400, 2500, 1_000_000 * POS_SCALE), &payer, &[&payer, &lp]);
     let mut rat_init = vec![0u8; 60];
     rat_init[0] = 0; rat_init[1] = rat_bump; rat_init[2] = 1; rat_init[3] = 2;
@@ -2518,7 +2529,7 @@ fn main() {
         AccountMeta::new_readonly(prog_id, false), AccountMeta::new_readonly(rat_mkt, false),
         AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(sol_feed, false),
     ], data: rat_init }, &payer, &[&payer, &lp]);
-    let mut c4: Clock = svm.get_sysvar(); c4.slot = s0 + 34; c4.unix_timestamp = 1_750_000_008; svm.set_sysvar(&c4);
+    let mut c4: Clock = svm.get_sysvar(); c4.slot = s0 + 38; c4.unix_timestamp = 1_750_000_008; svm.set_sysvar(&c4);
     let cu_ratio = send_ok_assert_log(&mut svm, Instruction { program_id: adapter_prog, accounts: vec![
         AccountMeta::new_readonly(rat_adp, false), AccountMeta::new(rat_mkt, false),
         AccountMeta::new_readonly(stoxx_feed, false), AccountMeta::new_readonly(rat_pda, false),
@@ -2578,9 +2589,9 @@ fn main() {
 
     // (e1) Live hours: STOXX jumps $500 -> $510 (fresh Pyth), SOL=$125 (fresh Chainlink)
     //      EWMA(20%) = 500*0.8 + 510*0.2 = $502.00; STOXX/SOL = 502/125 = 4.016000!
-    let mut c5: Clock = svm.get_sysvar(); c5.slot = s0 + 35; c5.unix_timestamp = 1_750_000_010; svm.set_sysvar(&c5);
-    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 35, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let mut c5: Clock = svm.get_sysvar(); c5.slot = s0 + 40; c5.unix_timestamp = 1_750_000_010; svm.set_sysvar(&c5);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 40, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 40, 12_500_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     let cu_ewma_live = send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &ewma_adp, 328), 502 * POS_SCALE, "Live EWMA(20%) $500->$510 = $502.00!");
     assert_eq!(read_u64(&svm, &ewma_mkt, 112), 4_016_000, "Live EWMA STOXX/SOL = 502/125 = 4.016!");
@@ -2588,14 +2599,14 @@ fn main() {
     // (e2) After-hours: STOXX closes (stale by +3,600s > 30s!), SOL moves live $125 -> $128!
     //      Verify spoofed feed_id is STILL rejected, stale 24/7 quote SOL is STILL rejected,
     //      and valid after-hours Crank carries ewma(STOXX)=$502 / live(SOL)=$128 = 3.921875!
-    let mut c6: Clock = svm.get_sysvar(); c6.slot = s0 + 36; c6.unix_timestamp = 1_750_003_610; svm.set_sysvar(&c6);
-    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xEEu8; 32], 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 36, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let mut c6: Clock = svm.get_sysvar(); c6.slot = s0 + 42; c6.unix_timestamp = 1_750_003_610; svm.set_sysvar(&c6);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2([0xEEu8; 32], 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 40, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 42, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_err_custom(&mut svm, ix_ewma_crank(), &payer, &[&payer], 305, "After-hours still rejects wrong Pyth feed_id");
-    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 35, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_000_000_000, 10_000_000, -8, 1_750_000_009, s0 + 40, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 1,  12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_err_custom(&mut svm, ix_ewma_crank(), &payer, &[&payer], 300, "After-hours still rejects stale 24/7 quote feed");
-    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 36, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 42, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     let cu_ewma_ah = send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &ewma_adp, 328), 502 * POS_SCALE, "After-hours carries EWMA base=$502!");
     assert_eq!(read_u64(&svm, &ewma_mkt, 112), 3_921_875, "After-hours STOXX/SOL = 502/128 = 3.921875!");
@@ -2607,15 +2618,15 @@ fn main() {
     let cu_push_ewma = send_ok(&mut svm, ix_push_ewma(lp.pubkey(), 520 * POS_SCALE), &payer, &[&payer, &lp]);
     assert_eq!(read_u64(&svm, &ewma_adp, 328), 505_600_000, "PushEwmaMark blended $502->$520 (20%) = $505.60!");
     send_err_custom(&mut svm, ix_push_ewma(lp.pubkey(), 510 * POS_SCALE), &payer, &[&payer, &lp], 308, "PushEwmaMark rejects same-slot double push");
-    let mut c7: Clock = svm.get_sysvar(); c7.slot = s0 + 37; c7.unix_timestamp = 1_750_003_615; svm.set_sysvar(&c7);
-    svm.set_account(sol_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 37, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let mut c7: Clock = svm.get_sysvar(); c7.slot = s0 + 44; c7.unix_timestamp = 1_750_003_615; svm.set_sysvar(&c7);
+    svm.set_account(sol_feed, Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 44, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &ewma_mkt, 112), 3_950_000, "After-hours Crank after PushEwmaMark = 505.60/128 = 3.950!");
 
     // (e4) Market re-open: Pyth STOXX resumes live at $515.60 -> EWMA smoothly blends to $507.60!
-    let mut c8: Clock = svm.get_sysvar(); c8.slot = s0 + 38; c8.unix_timestamp = 1_750_003_620; svm.set_sysvar(&c8);
-    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_560_000_000, 10_000_000, -8, 1_750_003_619, s0 + 38, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 38, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    let mut c8: Clock = svm.get_sysvar(); c8.slot = s0 + 46; c8.unix_timestamp = 1_750_003_620; svm.set_sysvar(&c8);
+    svm.set_account(stoxx_feed, Account { lamports: 10_000_000, data: make_pyth_v2(stoxx_fid, 51_560_000_000, 10_000_000, -8, 1_750_003_619, s0 + 46, 1), owner: pyth_prog_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(sol_feed,   Account { lamports: 10_000_000, data: make_chainlink_ocr2(8, 4, 2, s0 + 46, 12_800_000_000i128), owner: cl_prog_id, executable: false, rent_epoch: 0 }).unwrap();
     send_ok_assert_log(&mut svm, ix_ewma_crank(), &payer, &[&payer], "Program log: 0x1,");
     assert_eq!(read_u64(&svm, &ewma_adp, 328), 507_600_000, "Market re-open smoothly blends EWMA $505.60->$515.60 = $507.60!");
     println!(
@@ -2763,12 +2774,12 @@ fn main() {
         // Unhedged trader U: Long 10 SOL ($1,000 notional, IM=$100, MM=$50) on $100 capital!
         send_ok(&mut svm, ix_trade(prog_id, b_dex, b_sol_mkt, u_pfl, u_kp.pubkey(), lp_b_pfl, lp_kp.pubkey(), 0, 10 * POS_SCALE), &payer, &[&payer, &u_kp, &lp_kp]);
 
-        // Atomic Crank+LP Bundle on slot +1: both SOL and ETH jump +0.7% ($100 -> $100.70)!
+        // Atomic Crank+LP Bundle on slot +2: both SOL and ETH jump +0.7% ($100 -> $100.70)!
         // Crank bot atomically executes [Crank(SOL), RefreshLeg(SOL, LP), Crank(ETH), RefreshLeg(ETH, LP)]
         // in ONE Solana tx so R_SOL is funded IMMEDIATELY in the same tx!
-        set_slot(&mut svm, b_sl0 + 1);
-        write_custom(&mut svm, b_sol_feed, 100_700_000, b_sl0 + 1);
-        write_custom(&mut svm, b_eth_feed, 100_700_000, b_sl0 + 1);
+        set_slot(&mut svm, b_sl0 + 2);
+        write_custom(&mut svm, b_sol_feed, 100_700_000, b_sl0 + 2);
+        write_custom(&mut svm, b_eth_feed, 100_700_000, b_sl0 + 2);
         let ix_b_crank = |adp: Address, mkt: Address, fd: Address, pda: Address| Instruction {
             program_id: adapter_prog,
             accounts: vec![
@@ -2803,19 +2814,21 @@ fn main() {
         // then run K+1=5 consecutive -0.7% oracle slots WITHOUT liquidating U, then liquidate on honest slot!
         let mut p_sol = 100_700_000u64;
         for st in 2..=9u64 {
-            set_slot(&mut svm, b_sl0 + st);
+            let sl = b_sl0 + st * 2;
+            set_slot(&mut svm, sl);
             p_sol = (p_sol * 993) / 1000;
-            write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
+            write_custom(&mut svm, b_sol_feed, p_sol, sl);
             send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
         }
         // Refresh U right at MM boundary (~$52 capital vs ~$47.6 MM): still healthy!
         send_ok(&mut svm, ix_refresh_leg(prog_id, b_dex, b_sol_mkt, u_pfl, false), &payer, &[&payer]);
         let ins_before_k4 = read_u64(&svm, &b_sol_mkt, 224);
-        // K+1=5 consecutive censored oracle slots (-0.7%/slot, ZERO liquidations!)
+        // K+1=5 consecutive censored oracle slots (-0.7%/step, ZERO liquidations!)
         for st in 10..=14u64 {
-            set_slot(&mut svm, b_sl0 + st);
+            let sl = b_sl0 + st * 2;
+            set_slot(&mut svm, sl);
             p_sol = (p_sol * 993) / 1000;
-            write_custom(&mut svm, b_sol_feed, p_sol, b_sl0 + st);
+            write_custom(&mut svm, b_sol_feed, p_sol, sl);
             send_ok(&mut svm, ix_b_crank(b_sol_adp, b_sol_mkt, b_sol_feed, b_sol_pda), &payer, &[&payer]);
         }
         // Honest leader arrives and liquidates U: ZERO bad debt & I_SOL bit-for-bit untouched!
@@ -3057,7 +3070,7 @@ fn main() {
     assert_dex_invariants(&svm, &w_dex, &w_vault, &w_mkts, &w_all_pfls, "suite11-8leg-open");
 
     // 11.1 CRANK WORST-CASE: Batch 8x UpdateOracle in ONE single Solana tx!
-    w_slot += 1;
+    w_slot += 2;
     set_slot(&mut svm, w_slot);
     let orc_ixs: Vec<Instruction> = (0..MAX_LEGS)
         .map(|i| ix_update_oracle(prog_id, w_mkts[i], w_orc_shared.pubkey(), 100_700_000, 0, 0))
@@ -3130,7 +3143,7 @@ fn main() {
     let mut p0 = 100_700_000u64;
     let mut p_hi = 100_700_000u64;
     for step_idx in 0..19 {
-        w_slot += 1;
+        w_slot += 2;
         set_slot(&mut svm, w_slot);
         p_hi = p_hi + (p_hi * 7) / 1000;
         let mut step_ixs = Vec::new();
@@ -3160,7 +3173,7 @@ fn main() {
     //   mkt 0 currently has ASYMMETRIC ADL (`oiLong == rawBasisLong`, `oiShort < rawBasisShort`)!
     //   Step price UP (+0.5% -> Shorts lose via ceil `dkLose`, Longs win via floor `dkWin`) AND
     //   confirm `kShort` drop >= `kLong` rise scaled by rawBasis (ZERO under-collection)!
-    w_slot += 1;
+    w_slot += 2;
     set_slot(&mut svm, w_slot);
     let k_l0 = read_u64(&svm, &w_mkts[0], 304);
     let k_s0 = read_u64(&svm, &w_mkts[0], 312);
@@ -3174,7 +3187,7 @@ fn main() {
     //   Step mkt 0 down so User A's restored 0.8 Long becomes underwater again for 11.6c Takeover!
     let mut p0_cur = p0_up;
     for _ in 0..5 {
-        w_slot += 1;
+        w_slot += 2;
         set_slot(&mut svm, w_slot);
         p0_cur = p0_cur - (p0_cur * 7) / 1000;
         send_ok(&mut svm, ix_update_oracle(prog_id, w_mkts[0], w_orc_shared.pubkey(), p0_cur, 0, 0), &payer, &[&payer, &w_orc_shared]);
@@ -4440,7 +4453,7 @@ fn main() {
         // Honest BTC ticks down -0.75% ($100 -> $99.25): P_atk equity on BTC = $50 - $7.50 = $42.50 < MM ($49.625)!
         // Keeper liquidates P_atk on BTC: full -$7.50 loss + $9.925 liqFee paid strictly out of BTC.lockedMm ($50)!
         let i_btc_pre = read_u64(&svm, &x_btc_mkt, 224);
-        set_slot(&mut svm, sl_16a + 1);
+        set_slot(&mut svm, sl_16a + 2);
         send_ok(&mut svm, ix_update_oracle(prog_id, x_btc_mkt, x_btc_orc.pubkey(), 99_250_000, 0, 0), &payer, &[&payer, &x_btc_orc]);
         send_ok(&mut svm, ix_liquidate(prog_id, x_dex, x_btc_mkt, p_atk, keeper_tok, mint, x_vault, TOKEN_PROGRAM_ID), &payer, &[&payer]);
         assert_eq!(read_u64(&svm, &x_btc_mkt, 224), i_btc_pre, "16A PROVEN: ZERO cross-market contagion! Honest I_BTC draw == 0!");
