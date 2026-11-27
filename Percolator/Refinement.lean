@@ -3808,7 +3808,7 @@ theorem oracleClampedStepCore_refines_spec
             let stp := if raw < maxAllowed then raw else maxAllowed
             if oldP > stp then (oldP - stp, stp) else (1, oldP - 1)
         let remBudget := if maxAllowed >= step then maxAllowed - step else 0
-        let f ← if feedPrice != np && remBudget > 0 && fundBps > 0 then do
+        let f ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
             let rawF ← mulDiv64 oldP fundBps BPS_DEN
             pure (if rawF < remBudget then rawF else remBudget)
           else pure 0
@@ -3877,7 +3877,7 @@ theorem oracleClampedStepCore_refines_spec
       show (if maxAllowed ≥ step then maxAllowed - step else 0).toNat = _
       have hge : maxAllowed ≥ step := UInt64.le_iff_toNat_le.mpr hstpLe
       rw [ite_eq_left_of_eq_true _ _ (eq_true hge), u64_sub_toNat_of_le _ _ hstpLe]
-    by_cases hfc : ((feedPrice != np) && decide (remBudget > 0) && decide (fundBps > 0)) = true
+    by_cases hfc : ((feedPrice != oldP) && decide (remBudget > 0) && decide (fundBps > 0)) = true
     · rw [ite_eq_left_of_eq_true _ _ (eq_true hfc)] at h
       unfold SolanaM.bind at h
       cases hrf : mulDiv64 oldP fundBps BPS_DEN s1 with
@@ -4021,13 +4021,11 @@ theorem nextReserveRateU64_refines_spec (prevRate Q B Bvirt r : UInt64)
     memEqAbove s' s s.stackSp := by
   unfold RewardModule.nextReserveRateU64 at h
   unfold RewardModule.nextReserveRateNat
-  have h1nat : (1 : UInt64).toNat = 1 := rfl
+  have hmin : RewardModule.MIN_RATE_E6.toNat = 1_000 := rfl
   have hps : POS_SCALE.toNat = 1_000_000 := rfl
   have hmax : RewardModule.MAX_RATE_E6.toNat = 1_000_000_000_000 := rfl
   have hshr1 : ∀ x : UInt64, (x >>> 1).toNat = x.toNat / 2 := by
     intro x; rw [UInt64.toNat_shiftRight]; change x.toNat >>> 1 = x.toNat / 2; rw [Nat.shiftRight_eq_div_pow]
-  have hshr2 : ∀ x : UInt64, (x >>> 2).toNat = x.toNat / 4 := by
-    intro x; rw [UInt64.toNat_shiftRight]; change x.toNat >>> 2 = x.toNat / 4; rw [Nat.shiftRight_eq_div_pow]
   by_cases hc : (decide (B ≥ Bvirt) && decide (B > 0) && decide (Q > 0)) = true
   · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)] at h
     have hge : Bvirt.toNat ≤ B.toNat := UInt64.le_iff_toNat_le.mp (of_decide_eq_true (Bool.and_eq_true _ _ |>.mp (Bool.and_eq_true _ _ |>.mp hc).1).1)
@@ -4035,20 +4033,20 @@ theorem nextReserveRateU64_refines_spec (prevRate Q B Bvirt r : UInt64)
     have hQp : 0 < Q.toNat := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true (Bool.and_eq_true _ _ |>.mp hc).2)
     have hnat : B.toNat ≥ Bvirt.toNat ∧ B.toNat > 0 ∧ Q.toNat > 0 := ⟨hge, hBp, hQp⟩
     rw [ite_eq_left_of_eq_true _ _ (eq_true hnat)]
-    by_cases hcap : B / Q ≥ 4_000_000
+    by_cases hcap : B / Q ≥ 1_000_000
     · rw [ite_eq_left_of_eq_true _ _ (eq_true hcap)] at h
       dsimp only [Pure.pure, SolanaM.pure] at h; cases h
-      have hdivGe : B.toNat / Q.toNat ≥ 4_000_000 := by
+      have hdivGe : B.toNat / Q.toNat ≥ 1_000_000 := by
         have := UInt64.le_iff_toNat_le.mp hcap
         rw [UInt64.toNat_div] at this
         exact this
-      have hmulGe : 4_000_000 * Q.toNat ≤ B.toNat := by
+      have hmulGe : 1_000_000 * Q.toNat ≤ B.toNat := by
         have h1 := Nat.mul_le_mul_right Q.toNat hdivGe
         have h2 := Nat.div_mul_le_self B.toNat Q.toNat
         omega
-      have hrateGe : (B.toNat * 1_000_000) / Q.toNat ≥ 4_000_000_000_000 := by
+      have hrateGe : (B.toNat * 1_000_000) / Q.toNat ≥ 1_000_000_000_000 := by
         apply (Nat.le_div_iff_mul_le hQp).mpr
-        have h1 : 4_000_000_000_000 * Q.toNat = (4_000_000 * Q.toNat) * 1_000_000 := by omega
+        have h1 : 1_000_000_000_000 * Q.toNat = (1_000_000 * Q.toNat) * 1_000_000 := by omega
         have h2 := Nat.mul_le_mul_right 1_000_000 hmulGe
         omega
       refine ⟨?_, memEqAbove_refl s s.stackSp⟩
@@ -4061,27 +4059,21 @@ theorem nextReserveRateU64_refines_spec (prevRate Q B Bvirt r : UInt64)
         rw [hmd] at h; dsimp only at h
         have ⟨_, hcr, _, _, hmem⟩ := mulDiv64_stack_and_mem hsp hmd
         rw [hps] at hcr
-        let r4 := cr >>> 2
-        have hr4Nat : (cr >>> 2).toNat = (B.toNat * 1_000_000) / Q.toNat / 4 := by
-          rw [hshr2, hcr]
-        by_cases hlt1 : r4 < 1
-        · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt1)] at h; cases h
-          have hlt1Nat : (cr >>> 2).toNat < 1 := UInt64.lt_iff_toNat_lt.mp hlt1
-          refine ⟨?_, hmem⟩; dsimp only; rw [h1nat]; omega
-        · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt1)] at h
-          have hge1Nat : 1 ≤ (cr >>> 2).toNat := Nat.le_of_not_lt (fun h' => hlt1 (UInt64.lt_iff_toNat_lt.mpr h'))
-          by_cases hgtM : r4 > RewardModule.MAX_RATE_E6
+        by_cases hltm : cr < RewardModule.MIN_RATE_E6
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true hltm)] at h; cases h
+          have hltmNat : cr.toNat < 1_000 := by have := UInt64.lt_iff_toNat_lt.mp hltm; rw [hmin] at this; exact this
+          refine ⟨?_, hmem⟩; dsimp only; rw [hmin]; omega
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false hltm)] at h
+          have hgemNat : 1_000 ≤ cr.toNat := Nat.le_of_not_lt (fun h' => hltm (UInt64.lt_iff_toNat_lt.mpr (by rw [hmin]; omega)))
+          by_cases hgtM : cr > RewardModule.MAX_RATE_E6
           · rw [ite_eq_left_of_eq_true _ _ (eq_true hgtM)] at h; cases h
-            have hgtMNat : 1_000_000_000_000 < (cr >>> 2).toNat := by
-              have h1 := UInt64.lt_iff_toNat_lt.mp hgtM
-              dsimp only [r4] at h1; rw [hmax] at h1; exact h1
+            have hgtMNat : 1_000_000_000_000 < cr.toNat := by have := UInt64.lt_iff_toNat_lt.mp hgtM; rw [hmax] at this; exact this
             refine ⟨?_, hmem⟩; dsimp only; rw [hmax]; omega
-          · rw [ite_eq_right_of_eq_false _ _ (eq_false hgtM)] at h; cases h
-            have hleMNat : (cr >>> 2).toNat ≤ 1_000_000_000_000 :=
+          · rw [ite_eq_right_of_eq_false _ _ (eq_false hgtM)] at h
+            have hleMNat : cr.toNat ≤ 1_000_000_000_000 :=
               Nat.le_of_not_lt (fun h' => hgtM (UInt64.lt_iff_toNat_lt.mpr (by rw [hmax]; omega)))
-            refine ⟨?_, hmem⟩; dsimp only; omega
+            cases h; refine ⟨?_, hmem⟩; dsimp only; omega
   · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)] at h
-    dsimp only [Pure.pure, SolanaM.pure] at h; cases h
     have hnotNat : ¬ (B.toNat ≥ Bvirt.toNat ∧ B.toNat > 0 ∧ Q.toNat > 0) := by
       intro ⟨h1, h2, h3⟩
       have hd1 : decide (B ≥ Bvirt) = true := decide_eq_true (UInt64.le_iff_toNat_le.mpr h1)
@@ -4089,16 +4081,38 @@ theorem nextReserveRateU64_refines_spec (prevRate Q B Bvirt r : UInt64)
       have hd3 : decide (Q > 0) = true := decide_eq_true (UInt64.lt_iff_toNat_lt.mpr h3)
       simp [hd1, hd2, hd3] at hc
     rw [ite_eq_right_of_eq_false _ _ (eq_false hnotNat)]
-    refine ⟨?_, memEqAbove_refl s s.stackSp⟩
-    let half := prevRate >>> 1
-    have hhalfNat : (prevRate >>> 1).toNat = prevRate.toNat / 2 := hshr1 prevRate
-    by_cases hlt1 : half < 1
-    · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt1)]
-      have : (prevRate >>> 1).toNat < 1 := UInt64.lt_iff_toNat_lt.mp hlt1
-      rw [h1nat]; omega
-    · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt1)]
-      have : 1 ≤ (prevRate >>> 1).toNat := Nat.le_of_not_lt (fun h' => hlt1 (UInt64.lt_iff_toNat_lt.mpr h'))
-      omega
+    by_cases hBp : B > 0
+    · rw [ite_eq_left_of_eq_true _ _ (eq_true hBp)] at h
+      have hBpNat : B.toNat > 0 := UInt64.lt_iff_toNat_lt.mp hBp
+      rw [ite_eq_left_of_eq_true _ _ (eq_true hBpNat)]
+      by_cases hltm : prevRate < RewardModule.MIN_RATE_E6
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hltm)] at h; dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+        have hltmNat : prevRate.toNat < 1_000 := by have := UInt64.lt_iff_toNat_lt.mp hltm; rw [hmin] at this; exact this
+        refine ⟨?_, memEqAbove_refl s s.stackSp⟩; rw [hmin]; omega
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hltm)] at h
+        have hgemNat : 1_000 ≤ prevRate.toNat := Nat.le_of_not_lt (fun h' => hltm (UInt64.lt_iff_toNat_lt.mpr (by rw [hmin]; omega)))
+        by_cases hgtM : prevRate > RewardModule.MAX_RATE_E6
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true hgtM)] at h; dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+          have hgtMNat : 1_000_000_000_000 < prevRate.toNat := by have := UInt64.lt_iff_toNat_lt.mp hgtM; rw [hmax] at this; exact this
+          refine ⟨?_, memEqAbove_refl s s.stackSp⟩; rw [hmax]; omega
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false hgtM)] at h; dsimp only [Pure.pure, SolanaM.pure] at h
+          have hleMNat : prevRate.toNat ≤ 1_000_000_000_000 :=
+            Nat.le_of_not_lt (fun h' => hgtM (UInt64.lt_iff_toNat_lt.mpr (by rw [hmax]; omega)))
+          cases h; refine ⟨?_, memEqAbove_refl s s.stackSp⟩; omega
+    · rw [ite_eq_right_of_eq_false _ _ (eq_false hBp)] at h
+      have hB0Nat : ¬ (B.toNat > 0) := fun hp => hBp (UInt64.lt_iff_toNat_lt.mpr hp)
+      rw [ite_eq_right_of_eq_false _ _ (eq_false hB0Nat)]
+      dsimp only [Pure.pure, SolanaM.pure] at h; cases h
+      refine ⟨?_, memEqAbove_refl s s.stackSp⟩
+      let half := prevRate >>> 1
+      have hhalfNat : (prevRate >>> 1).toNat = prevRate.toNat / 2 := hshr1 prevRate
+      by_cases hltm : half < RewardModule.MIN_RATE_E6
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hltm)]
+        have : (prevRate >>> 1).toNat < 1_000 := by have := UInt64.lt_iff_toNat_lt.mp hltm; rw [hmin] at this; exact this
+        rw [hmin]; omega
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hltm)]
+        have : 1_000 ≤ (prevRate >>> 1).toNat := Nat.le_of_not_lt (fun h' => hltm (UInt64.lt_iff_toNat_lt.mpr (by rw [hmin]; omega)))
+        omega
 
 /-- **Refinement #25a (`validateMatcherHeader` Enforces Anti-Replay ABI Header on `SvmState.mem`)**:
     Directly on `SvmState.mem`, `Program.validateMatcherHeader` is read-only (`s' = s`) and

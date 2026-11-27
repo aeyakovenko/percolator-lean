@@ -694,10 +694,10 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   -- Compute on-chain premium funding strictly within remaining clamp budget
   let remBudget := if maxAllowed >= step then maxAllowed - step else 0
   let fundBps ← loadU64 aData AdpOff.fundingBpsPerStep
-  let (fundSign, fundE6) ← if feedPrice != newP && remBudget > 0 && fundBps > 0 then do
+  let (fundSign, fundE6) ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
       let rawF ← mulDiv64 oldP fundBps BPS_DEN
       let f := if rawF < remBudget then rawF else remBudget
-      let sign : UInt8 := if newP > feedPrice then 0 else 1
+      let sign : UInt8 := if oldP > feedPrice then 0 else 1
       pure (sign, f)
     else pure (0, 0)
 

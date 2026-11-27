@@ -47,6 +47,7 @@ def MAGIC_REWARD    : UInt32 := 0x4D574552 -- "REWM"
 def MAGIC_EPOCH     : UInt32 := 0x48435045 -- "EPCH"
 def MAGIC_BID       : UInt32 := 0x52444942 -- "BIDR"
 def TAG_REW_AUTH    : UInt32 := 0x6D776572 -- "rewm"
+def MIN_RATE_E6     : UInt64 := 1_000             -- min 0.001 target-atoms per 1 quote-atom (blocks floor-1 collapse!)
 def MAX_RATE_E6     : UInt64 := 1_000_000_000_000 -- 10^6 target-atoms per 1 quote-atom (at E6 scale)
 def MAX_VIRT_BIDS   : UInt64 := 0x3FFFFFFFFFFFFFFF -- 2^62 - 1 (caps virtBids so virtBids + totalBids never bricks StartEpoch!)
 def MIN_EPOCH_SLOTS : UInt64 := 32                -- >= 8x Solana K=4 leader window
@@ -149,15 +150,20 @@ def epochRolloverNat (Q B Bvirt : Nat) : Nat :=
   Q - epochQuotePaidNat Q B Bvirt
 
 /-- Once-per-epoch self-calibrating virtual-reserve rate update (`reserveRateE6`):
-    - Healthy epoch (`B ≥ B_virt ∧ B > 0 ∧ Q > 0`): `clamp((B * 10^6 / Q) / 4, 1, MAX_RATE_E6)`.
-    - Under-filled / quiet epoch (e.g. 1000x token pump): `max 1 (prevRate / 2)`. -/
+    - Healthy epoch (`B ≥ B_virt ∧ B > 0 ∧ Q > 0`): `clamp(clearedRate, MIN_RATE_E6, MAX_RATE_E6)`
+      (NEVER divides by 4 -> strictly non-decreasing on healthy epochs, blocking `#111` collapse!).
+    - Under-filled dust-bid epoch (`0 < B < B_virt`): keeps `prevRate` unchanged (`clamp(prevRate, MIN_RATE_E6, MAX_RATE_E6)`),
+      blocking dust-bid rate halving attacks!
+    - Truly empty epoch (`B == 0`, e.g. 1000x token pump with 0 quote paid out):
+      `max MIN_RATE_E6 (prevRate / 2)`. -/
 def nextReserveRateNat (prevRate Q B Bvirt : Nat) : Nat :=
   if B ≥ Bvirt ∧ B > 0 ∧ Q > 0 then
     let clearedRate := (B * 1_000_000) / Q
-    let r4 := clearedRate / 4
-    min 1_000_000_000_000 (max 1 r4)
+    min 1_000_000_000_000 (max 1_000 clearedRate)
+  else if B > 0 then
+    min 1_000_000_000_000 (max 1_000 prevRate)
   else
-    max 1 (prevRate / 2)
+    max 1_000 (prevRate / 2)
 
 /-- **THEOREM 1 (`epochQuotePaid_le_pot` & Exact Rollover Conservation)**:
     Across EVERY `Q, B, B_virt`: `quotePaid ≤ Q` and `quotePaid + rollover = Q` (zero quote lost!). -/
@@ -258,16 +264,42 @@ theorem spam_bid_monotone_of_pos (Q b B Bvirt Δb : Nat) (hpos : B + Bvirt > 0) 
   simp only [h1, h2, ↓reduceIte]
   exact Nat.div_le_div_left (by omega) hpos
 
-/-- **THEOREM 6 (`reserveRate_halves_on_underfill` — Closes Gap R3: Zero Permanent 1000x-Pump Freeze!)**:
-    On any under-filled epoch (`B < B_virt`), `nextReserveRateNat` halves `prevRate` down toward `1`
-    (guaranteed `1 ≤ nextRate ≤ MAX_RATE_E6`), so a 1000x token pump can NEVER permanently freeze rewards! -/
-theorem reserveRate_halves_on_underfill (prevRate Q B Bvirt : Nat) (hunder : B < Bvirt) :
-    nextReserveRateNat prevRate Q B Bvirt = max 1 (prevRate / 2) ∧
-    1 ≤ nextReserveRateNat prevRate Q B Bvirt := by
+/-- **THEOREM 6 (`reserveRate_halves_on_empty_epoch` — Closes Gap R3 & `#111`)**:
+    On a truly empty epoch (`B = 0`, 0 quote spent), `nextReserveRateNat` halves `prevRate` down toward
+    `MIN_RATE_E6 = 1_000` (so a 1000x token pump never permanently freezes rewards, yet rate never hits `1`!). -/
+theorem reserveRate_halves_on_empty_epoch (prevRate Q Bvirt : Nat) :
+    nextReserveRateNat prevRate Q 0 Bvirt = max 1_000 (prevRate / 2) ∧
+    1_000 ≤ nextReserveRateNat prevRate Q 0 Bvirt := by
+  unfold nextReserveRateNat
+  have h1 : ¬ (0 ≥ Bvirt ∧ 0 > 0 ∧ Q > 0) := by omega
+  have h2 : ¬ (0 > 0) := by omega
+  rw [ite_eq_right_of_eq_false _ _ (eq_false h1), ite_eq_right_of_eq_false _ _ (eq_false h2)]
+  exact ⟨rfl, Nat.le_max_left 1_000 _⟩
+
+/-- **THEOREM 6b (`reserveRate_unchanged_on_dust_bid` — Closes `#111` Dust-Bid Rate Collapse)**:
+    A nonzero underfilled dust bid (`0 < B < B_virt`) can NEVER halve or lower `reserveRateE6`! -/
+theorem reserveRate_unchanged_on_dust_bid (prevRate Q B Bvirt : Nat)
+    (hpos : 0 < B) (hunder : B < Bvirt) (hlo : 1_000 ≤ prevRate) (hhi : prevRate ≤ 1_000_000_000_000) :
+    nextReserveRateNat prevRate Q B Bvirt = prevRate := by
   unfold nextReserveRateNat
   have hnot : ¬ (B ≥ Bvirt ∧ B > 0 ∧ Q > 0) := by omega
-  simp only [hnot, ↓reduceIte]
-  exact ⟨trivial, Nat.le_max_left 1 _⟩
+  rw [ite_eq_right_of_eq_false _ _ (eq_false hnot), ite_eq_left_of_eq_true _ _ (eq_true hpos)]
+  omega
+
+/-- **THEOREM 6c (`reserveRate_non_decreasing_on_healthy_epoch` — Closes `#111` Healthy-Epoch Collapse)**:
+    Whenever `B ≥ ceil(Q * prevRate / 10^6)` (`B ≥ B_virt`) with `Q > 0` and `prevRate ≤ MAX_RATE_E6`,
+    `nextReserveRateNat` NEVER drops below `prevRate`! -/
+theorem reserveRate_non_decreasing_on_healthy_epoch (prevRate Q B Bvirt : Nat)
+    (hQ : 0 < Q) (hB : 0 < B) (hge : B ≥ Bvirt)
+    (hbv : Bvirt * 1_000_000 ≥ Q * prevRate) (hhi : prevRate ≤ 1_000_000_000_000) :
+    prevRate ≤ nextReserveRateNat prevRate Q B Bvirt := by
+  unfold nextReserveRateNat
+  rw [ite_eq_left_of_eq_true _ _ (eq_true ⟨hge, hB, hQ⟩)]
+  have hmul : Q * prevRate ≤ B * 1_000_000 :=
+    Nat.le_trans hbv (Nat.mul_le_mul_right 1_000_000 hge)
+  have hdiv : prevRate ≤ (B * 1_000_000) / Q :=
+    (Nat.le_div_iff_mul_le hQ).mpr (by rw [Nat.mul_comm]; exact hmul)
+  exact Nat.le_min.mpr ⟨hhi, Nat.le_trans hdiv (Nat.le_max_right 1_000 _)⟩
 
 /-- **THEOREM 7 (`feeSplit_exact_conservation`)**:
     Core trade-fee split (`rewFee = floor(fee2 * rewBps / 10000)`, `insFee = fee2 - rewFee`)
@@ -428,21 +460,25 @@ def checkInitializedTokAcc (tokAcc tokProg mint ownerKeyPtr : AccountView) : Sol
   SolanaM.require (rc == 0) rc
 
 /-- Pure overflow-free runtime self-calibration matching `nextReserveRateNat`!
-    If `B >= B_virt ∧ B > 0 ∧ Q > 0`: clamps `(B * 10^6 / Q) / 4` into `[1, MAX_RATE_E6]` without
-    EVER overflowing `mulDiv64` even on a 1,000,000x token dump (`B / Q >= 4_000_000`)!
-    Otherwise halves `prevRate` down to `max(1, prevRate / 2)`. -/
+    - Healthy (`B >= B_virt ∧ B > 0 ∧ Q > 0`): clamps `clearedRate = floor(B * 10^6 / Q)` into `[MIN_RATE_E6, MAX_RATE_E6]`
+      (NO `/ 4` slash -> strictly non-decreasing on healthy epochs!).
+    - Nonzero dust/underfilled (`0 < B < B_virt`): leaves `prevRate` unchanged (clamped to `[MIN_RATE_E6, MAX_RATE_E6]`).
+    - Truly empty (`B == 0`): halves `prevRate` down to `max(MIN_RATE_E6, prevRate / 2)`. -/
 def nextReserveRateU64 (prevRate Q B Bvirt : UInt64) : SolanaM UInt64 := do
   if B >= Bvirt && B > 0 && Q > 0 then
-    if B / Q >= 4_000_000 then
+    if B / Q >= 1_000_000 then
       return MAX_RATE_E6
     let clearedRate ← mulDiv64 B POS_SCALE Q
-    let r4 := clearedRate >>> 2
-    if r4 < 1 then return 1
-    else if r4 > MAX_RATE_E6 then return MAX_RATE_E6
-    else return r4
+    if clearedRate < MIN_RATE_E6 then return MIN_RATE_E6
+    else if clearedRate > MAX_RATE_E6 then return MAX_RATE_E6
+    else return clearedRate
+  else if B > 0 then
+    if prevRate < MIN_RATE_E6 then return MIN_RATE_E6
+    else if prevRate > MAX_RATE_E6 then return MAX_RATE_E6
+    else return prevRate
   else
     let half := prevRate >>> 1
-    return if half < 1 then 1 else half
+    return if half < MIN_RATE_E6 then MIN_RATE_E6 else half
 
 /-! ### 5 Minimal O(1) Zero-Admin-Rug Instructions -/
 
@@ -542,7 +578,7 @@ def handleInitReward (input : Ptr) : SolanaM Unit := do
   SolanaM.require (burnMode <= 1) RErr.badBurnMode
   SolanaM.require (epochSlots >= MIN_EPOCH_SLOTS && epochSlots <= MAX_EPOCH_SLOTS) PErr.invalidParams
   SolanaM.require (minBatchQuote >= 1) PErr.invalidParams
-  SolanaM.require (initReserveRateE6 >= 1 && initReserveRateE6 <= MAX_RATE_E6) PErr.invalidParams
+  SolanaM.require (initReserveRateE6 >= MIN_RATE_E6 && initReserveRateE6 <= MAX_RATE_E6) PErr.invalidParams
 
   let cData := AccountView.dataPtr cfg
   zeroRewardWords cData 0 (RewOff.size >>> 3)

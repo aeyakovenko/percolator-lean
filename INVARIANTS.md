@@ -1,6 +1,6 @@
 # `percolator-lean` Formal Invariants & Proof Catalog
 
-Every economic, solvency, risk-isolation, ABI-parsing, handler-level, and liveness invariant of `percolator-lean` is formalized and machine-checked in Lean 4's kernel across **15 modules** (**273 public theorems**, 322 including private helper lemmas, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**):
+Every economic, solvency, risk-isolation, ABI-parsing, handler-level, and liveness invariant of `percolator-lean` is formalized and machine-checked in Lean 4's kernel across **15 modules** (**275 public theorems**, 324 including private helper lemmas, **0 `sorry`**, **0 custom axioms**, and **0 external Lean dependencies**):
 
 | Module | Public Theorems | Scope |
 |---|---:|---|
@@ -12,7 +12,7 @@ Every economic, solvency, risk-isolation, ABI-parsing, handler-level, and livene
 | [`Percolator/HandlerProofs.lean`](Percolator/HandlerProofs.lean) | 23 | End-to-end `SolanaM` handler theorems (`RefreshLeg`, `DepositCollateral`, `WithdrawCollateral`, `Trade`, `TombstoneMarket`, `StartWindDown`, `mode=4` `legCloseCapU64`) |
 | [`Percolator/LivenessProofs.lean`](Percolator/LivenessProofs.lean) | 8 | Multi-market `SvmState`→firewall coupling, `$1T` TVL / 8-leg `u64` non-overflow bounds, wind-down termination |
 | [`Percolator/ExternalProofs.lean`](Percolator/ExternalProofs.lean) | 8 | External program isolation & CPI boundary theorems |
-| [`Percolator/RewardModule.lean`](Percolator/RewardModule.lean) | 10 | Gavel $xy=k$ batch buy-and-burn solvency, quiet-epoch cap, spam monotonicity & exact fee-split conservation |
+| [`Percolator/RewardModule.lean`](Percolator/RewardModule.lean) | 11 | Gavel $xy=k$ batch buy-and-burn solvency, quiet-epoch cap, spam monotonicity, anti-rate-collapse proofs (`MIN_RATE_E6`) & exact fee-split conservation |
 | [`Percolator/OracleAdapter.lean`](Percolator/OracleAdapter.lean) | 8 | Pyth/Chainlink/Switchboard clamp + funding, OCR2 ring-buffer, E6 scaling, 2-leg ratio & EWMA bounds/refinement |
 | [`Percolator/LimitMatcher.lean`](Percolator/LimitMatcher.lean) | 7 | Hyperliquid-parity 8-slot orderbook layout, fill conservation, OCO partner sync, TWAP slice cap, ALO passive check, SL/TP triggers & monotone trailing watermark |
 | [`Percolator/Matcher.lean`](Percolator/Matcher.lean) | 7 | CPI-Out PropAMM layout, ask/bid bounds, `maxMove` clamp & LP-favorable spread |
@@ -62,7 +62,7 @@ Every economic, solvency, risk-isolation, ABI-parsing, handler-level, and livene
 | **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** | `limit_book_layout_valid`, `limit_fill_conserves_remaining`, `oco_sync_cancels_partner`, `twap_slice_bounded`, `alo_post_only_passive`, `stop_and_tp_trigger_sound`, `trailing_watermark_monotone` | 864 B 8-slot Hyperliquid-parity orderbook preserves exact `remainingQty + fillQty = oldRemaining`, atomically decrements/cancels linked OCO partners, bounds TWAP slices to `min(sliceQty, remaining)`, enforces passive ALO sides, verifies SL/TP trigger directions, and proves monotone trailing-stop watermarks. |
 | **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** | `crank_step_and_funding_within_clamp`, `ringBufferPrevIdx_lt`, `scaleToE6Nat_mono_and_id`, `ratio_crank_within_clamp`, `ewmaBlendNat_bounds`, `ewmaBlendNat_fixed_point`, `ewma_ratio_crank_within_clamp`, `ewmaBlendU64_refines_spec` | Clamped convergence + funding, OCR2 ring-buffer bounds, monotone E6 scaling, 2-leg ratio clamping, and EWMA bounds/refinement. |
 | **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** | `hlp_layout_sizes_valid`, `hlp_first_deposit_locks_donation`, `hlp_nav_no_dilution_arb`, `hlp_withdraw_le_capital`, `hlp_sum_withdrawals_solvent`, `hlp_strategist_subset_blocks_scam` | Anti-ERC-4626 inflation lock, non-dilutive NAV minting, solvent pro-rata withdrawals, and allowlist-subset anti-rug pinning. |
-| **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** | `reward_layout_sizes_valid`, `epochQuotePaid_le_pot`, `xy_k_invariant_preserved`, `batch_solvency_all_bidders_claimable`, `quiet_epoch_price_cap`, `spam_bid_monotone_of_pos`, `reserveRate_halves_on_underfill`, `feeSplit_exact_conservation`, `virtBidsCapped_in_bounds` | Exact $xy=k$ batch auction clearing, bidder solvency, anti-dust/quiet-epoch cap, spam monotonicity, and exact fee-split conservation into the isolated 5th bucket `F_tot`. |
+| **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** | `reward_layout_sizes_valid`, `epochQuotePaid_le_pot`, `xy_k_invariant_preserved`, `batch_solvency_all_bidders_claimable`, `quiet_epoch_price_cap`, `spam_bid_monotone_of_pos`, `reserveRate_halves_on_empty_epoch`, `reserveRate_unchanged_on_dust_bid`, `reserveRate_non_decreasing_on_healthy_epoch`, `feeSplit_exact_conservation`, `virtBidsCapped_in_bounds` | Exact $xy=k$ batch auction clearing, bidder solvency, anti-dust/quiet-epoch cap, spam monotonicity, anti-rate-collapse monotonicity on healthy & dust-bid epochs (`MIN_RATE_E6 = 1_000`), and exact fee-split conservation into the isolated 5th bucket `F_tot`. |
 
 ---
 

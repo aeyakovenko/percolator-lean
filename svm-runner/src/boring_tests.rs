@@ -2857,7 +2857,50 @@ pub fn test_22_issue110_self_made_market_overflow_dos_blocked(elf: &[u8]) {
     println!("       [t22] Issue #110 + #109 deadlock regression verified: bankrupt BTC & self-made m_atk both liquidated cleanly!");
 }
 
-/// Runs all 22 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
+/// Test 23: PR #9 (mode=1 bounded close qty) & Issue #100 Regression!
+///   Proves two dust legs (1 unit each) in a large market (1,000 OI) CANNOT call `Trade(mode=1, qty=1000)`
+///   to zero the entire market's OI / crush `adlLong`/`adlShort` to 0:
+///     - `Trade(mode=1, qty=1000)` MUST be rejected (`Custom(103)`)!
+///     - `Trade(mode=1, qty=1)` closes cleanly while leaving the other 999 OI & `adl=ADL_ONE` untouched!
+pub fn test_23_pr9_mode1_qty_bounded_by_leg_cap(elf: &[u8]) {
+    let mut e = BoringEnv::new(elf);
+    let btc = e.create_market(100 * POS_SCALE, 10, 1000, 500, 100, 0, 75);
+
+    let whale_l = e.create_trader(200_000 * POS_SCALE, 100_000 * POS_SCALE);
+    let whale_s = e.create_trader(200_000 * POS_SCALE, 100_000 * POS_SCALE);
+    let dust_l  = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+    let dust_s  = e.create_trader(1_000 * POS_SCALE, 100 * POS_SCALE);
+
+    // Whale pair opens 999 BTC; Dust pair opens 1 BTC -> total OI = 1,000 BTC
+    e.trade(btc, &whale_l, &whale_s, 0, 999 * POS_SCALE);
+    e.trade(btc, &dust_l,  &dust_s,  0, 1 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 256), 1_000 * POS_SCALE);
+
+    // Attack (PR #9 item 1 / #100): dust pair tries `Trade(mode=1, qty=1000)` -> MUST FAIL Custom(103)!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, btc, dust_l.pfl, dust_l.kp.pubkey(), dust_s.pfl, dust_s.kp.pubkey(), 1, 1_000 * POS_SCALE),
+        &e.payer, &[&e.payer, &dust_l.kp, &dust_s.kp], 103,
+        "PR #9 / #100: dust pair MUST NOT close qty > legCloseCap (Custom 103)",
+    );
+    // Even qty = 1_000_001 (1 atom over dust leg's 1.0) MUST FAIL Custom(103)!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade(e.prog_id, e.dex, btc, dust_l.pfl, dust_l.kp.pubkey(), dust_s.pfl, dust_s.kp.pubkey(), 1, POS_SCALE + 1),
+        &e.payer, &[&e.payer, &dust_l.kp, &dust_s.kp], 103,
+        "PR #9 / #100: mode=1 rejects even 1 atom over legCloseCap (Custom 103)",
+    );
+    // Control: exact `qty = 1 BTC` succeeds cleanly and preserves whale's 999 OI + ADL_ONE!
+    e.trade(btc, &dust_l, &dust_s, 1, 1 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 256), 999 * POS_SCALE, "Whale OI preserved at 999!");
+    assert_eq!(read_u64(&e.svm, &btc, 264), 999 * POS_SCALE, "Whale Short OI preserved at 999!");
+    assert_eq!(read_u64(&e.svm, &btc, 288), ADL_ONE, "adlLong preserved at ADL_ONE!");
+    assert_eq!(read_u64(&e.svm, &btc, 296), ADL_ONE, "adlShort preserved at ADL_ONE!");
+    e.check("t23-mode1-qty-bounded");
+    println!("       [t23] PR #9 / #100 regression verified: mode=1 dust over-close rejected (103), exact 1-BTC close preserved 999 OI & ADL_ONE!");
+}
+
+/// Runs all 23 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -2881,7 +2924,8 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &
     test_20_pr8_bankrupt_settlement_blocked_regression(elf, matcher_elf);
     test_21_issue107_partial_liq_post_fee_solvency(elf);
     test_22_issue110_self_made_market_overflow_dos_blocked(elf);
-    println!("[PASS] Suite 12: 22 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
+    test_23_pr9_mode1_qty_bounded_by_leg_cap(elf);
+    println!("[PASS] Suite 12: 23 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
 }
 
 #[cfg(test)]
@@ -2921,4 +2965,5 @@ mod tests {
     #[test] fn boring_20_pr8_bankrupt_settlement_blocked_regression() { let (e, m, _) = load_elfs(); test_20_pr8_bankrupt_settlement_blocked_regression(&e, &m); }
     #[test] fn boring_21_issue107_partial_liq_post_fee_solvency() { let (e, _, _) = load_elfs(); test_21_issue107_partial_liq_post_fee_solvency(&e); }
     #[test] fn boring_22_issue110_self_made_market_overflow_dos_blocked() { let (e, _, _) = load_elfs(); test_22_issue110_self_made_market_overflow_dos_blocked(&e); }
+    #[test] fn boring_23_pr9_mode1_qty_bounded_by_leg_cap() { let (e, _, _) = load_elfs(); test_23_pr9_mode1_qty_bounded_by_leg_cap(&e); }
 }

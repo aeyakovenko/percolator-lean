@@ -1190,12 +1190,19 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
-    SolanaM.require (qty <= oiL && qty <= oiS) PErr.invalidParams
-
     let rLegL ← loadU64 lpL LegOff.rawBasis
     let rLegS ← loadU64 lpS LegOff.rawBasis
     let rMktL ← loadU64 mData MktOff.rawBasisLong
     let rMktS ← loadU64 mData MktOff.rawBasisShort
+    SolanaM.require (qty <= oiL && qty <= oiS && rLegL > 0 && rLegS > 0 && rMktL > 0 && rMktS > 0) PErr.invalidParams
+    let capL ←
+      if oiL == rMktL then pure (if rLegL < oiL then rLegL else oiL)
+      else do let q ← mulDiv64Ceil rLegL oiL rMktL; pure (if q < oiL then q else oiL)
+    let capS ←
+      if oiS == rMktS then pure (if rLegS < oiS then rLegS else oiS)
+      else do let q ← mulDiv64Ceil rLegS oiS rMktS; pure (if q < oiS then q else oiS)
+    SolanaM.require (qty <= capL && qty <= capS) PErr.invalidParams
+
     let redL ← proportionalRawRedU64 qty rLegL rMktL oiL
     let redS ← proportionalRawRedU64 qty rLegS rMktS oiS
     SolanaM.require (redL > 0 && redS > 0 && rLegL >= redL && rLegS >= redS &&

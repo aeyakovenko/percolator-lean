@@ -2352,6 +2352,9 @@ fn main() {
     }
 
     // Permissionless 4-slot smooth auto-clamped convergence ($100 -> $104 -> $108.16 -> $112.4864 -> $115.00)!
+    // On step 4 (`$112.4864 -> $115.00`, unclamped with `remBudget > 0`), `OracleAdapter` MUST apply nonzero
+    // funding (`fundBps=10`, sign=1 Shorts->Longs) so `kLong` increases strictly beyond the pure `$15.00` mark delta!
+    let k_long_pre_crank = read_u64(&svm, &comp_mkt2, 304);
     let mut cu_crank = 0u64;
     for step in 1..=4u64 {
         let sl = s0 + 20 + step;
@@ -2360,6 +2363,8 @@ fn main() {
         cu_crank = send_ok_assert_log(&mut svm, ix_crank(), &payer, &[&payer], "Program log: 0x1,");
     }
     assert_eq!(read_u64(&svm, &comp_mkt2, 112), 115 * POS_SCALE, "OracleAdapter converged smoothly to $115!");
+    let k_long_delta = read_u64(&svm, &comp_mkt2, 304) - k_long_pre_crank;
+    assert!(k_long_delta > 15 * POS_SCALE, "PR #9 crank funding guard fix: step 4 MUST pay nonzero funding (kLong delta={} <= 15e6)!", k_long_delta);
 
     // 9A-2: Native Pyth V2 (`PriceUpdateV2`), Chainlink OCR2 (`Transmissions`),
     //       Switchboard On-Demand (`PullFeedAccountData`), AND 2-Leg Composite Ratio (`Pyth / Chainlink`)!
@@ -3673,25 +3678,31 @@ fn main() {
         }
 
         if i == 1 {
-            // R5 QUIET/CENSORED EPOCH VERIFICATION (Theorem 4: `payout * B_virt <= Q * b`):
+            // R5 QUIET/CENSORED EPOCH VERIFICATION + #111 DUST-BID RATE COLLAPSE BLOCKED:
             //   With `reserveRateE6 = 0.5`, 1 target-atom buys at most `floor(Q / (1 + Q/2)) = 1`
-            //   quote atom (0.00002% of pot!), >99.9999% rolls over intact, AND `reserveRateE6` halves (500k -> 250k)!
+            //   quote atom (0.00002% of pot!), >99.9999% rolls over intact, AND a dust bid (`0 < B < B_virt`)
+            //   leaves `reserveRateE6` UNCHANGED (blocks #111 dust-bid halving collapse!).
             assert!((expected_q_paid as u128) * (b_virt as u128) <= (q_pot as u128), "R5: quiet_epoch_price_cap violated!");
             assert!(expected_q_paid <= 2, "R5: 1-atom bidder in quiet epoch extracted {} > 2 atoms!", expected_q_paid);
             assert_eq!(read_u64(&svm, &r_cfgs[1], 368), expected_roll, "R5: quiet epoch pot rolled over intact!");
-            assert_eq!(read_u64(&svm, &r_cfgs[1], 344), init_reserve_rate_e6 / 2, "R3: under-filled epoch halved reserveRateE6!");
+            assert_eq!(read_u64(&svm, &r_cfgs[1], 344), init_reserve_rate_e6, "#111: dust bid must NOT halve reserveRateE6!");
 
             // Claiming the 1-atom spam receipt yields at most `expected_q_paid` (1 micro-USDC); Epoch 2 starts IMMEDIATELY!
             let sp_pre = token_amount(&svm, &r_spammer_q);
             send_ok(&mut svm, ix_claim_quote(rew_prog, r_cfgs[1], r_ep1[1], spam_rec_m1, r_spammer.pubkey(), r_pdas[1], r_q_vaults[1], r_spammer_q, mint, TOKEN_PROGRAM_ID), &payer, &[&payer, &r_spammer]);
             assert_eq!(token_amount(&svm, &r_spammer_q) - sp_pre, expected_q_paid, "R5: 1-atom attacker payout exact!");
 
-            // Overlapping Epoch 2 starts IMMEDIATELY from rolloverQuote with halved reserveRateE6!
+            // Overlapping Epoch 2 starts IMMEDIATELY from rolloverQuote with unchanged reserveRateE6;
+            // settling Epoch 2 with ZERO bids (`B == 0`) halves `reserveRateE6` (500k -> 250k, R3 anti-freeze)!
             let ep2 = create_prog_acc(&mut svm, &rew_prog, EPOCH_SIZE);
             send_ok(&mut svm, ix_start_epoch(rew_prog, r_cfgs[1], ep2, r_dex, r_mkts[1], r_pdas[1], mint, r_vault, r_q_vaults[1], TOKEN_PROGRAM_ID, prog_id), &payer, &[&payer]);
             assert_eq!(read_u64(&svm, &ep2, 48), expected_roll, "Epoch 2 carries 100% of rolled-over quote!");
-            let exp_virt2 = ((expected_roll as u128 * (init_reserve_rate_e6 / 2) as u128 + 999_999) / 1_000_000) as u64;
-            assert_eq!(read_u64(&svm, &ep2, 56), exp_virt2, "Epoch 2 virtBids reflects ceil(rollover * 0.25)!");
+            let exp_virt2 = ((expected_roll as u128 * init_reserve_rate_e6 as u128 + 999_999) / 1_000_000) as u64;
+            assert_eq!(read_u64(&svm, &ep2, 56), exp_virt2, "Epoch 2 virtBids reflects unchanged reserveRateE6 after dust bid!");
+            let ep2_end = read_u64(&svm, &ep2, 88);
+            set_slot(&mut svm, ep2_end);
+            send_ok(&mut svm, ix_settle_epoch(rew_prog, r_cfgs[1], ep2, r_pdas[1], r_t_escrows[1], r_t_mints[1], r_t_progs[1], r_sinks[1]), &payer, &[&payer]);
+            assert_eq!(read_u64(&svm, &r_cfgs[1], 344), init_reserve_rate_e6 / 2, "R3: truly empty (B==0) epoch halves reserveRateE6!");
         } else {
             // Healthy epoch: bidder_a (10) & bidder_b (30) claim at EXACT uniform xy=k price AND reclaim BidReceipt rent!
             let qa_pre = token_amount(&svm, &r_bidder_a_q);
@@ -3761,11 +3772,17 @@ fn main() {
             prog_id, r_dex, sp_mkt, mint, r_orc.pubkey(), sp_creator.pubkey(), sp_creator_tok, fee_vault,
             100 * POS_SCALE, 10, 500, 0, 1000, 500, 100, 10, 75, 2500, 1_000_000 * POS_SCALE, 0, 10_000, sp_pda,
         ), &payer, &[&payer, &sp_creator]);
-        // minBatchQuote = 100, initReserveRateE6 = 1 -> product = 100 < 1_000_000!
-        send_ok(&mut svm, ix_init_reward(
+        // #111: `initReserveRateE6 = 1 < MIN_RATE_E6 (1_000)` MUST be rejected (`Custom(103)`)!
+        send_err_custom(&mut svm, ix_init_reward(
             rew_prog, sp_cfg, sp_creator.pubkey(), prog_id, r_dex, sp_mkt, sp_pda,
             mint, sp_q_vault, TOKEN_PROGRAM_ID, sp_t_mint, sp_t_escrow, TOKEN_PROGRAM_ID, None,
             sp_bump, 0, 32, 100, 1,
+        ), &payer, &[&payer, &sp_creator], 103, "#111: InitReward rejects initReserveRateE6 < MIN_RATE_E6");
+        // minBatchQuote = 100, initReserveRateE6 = 1_000 -> 200 * 1_000 = 200_000 < 1_000_000 -> virtBids ceils to 1!
+        send_ok(&mut svm, ix_init_reward(
+            rew_prog, sp_cfg, sp_creator.pubkey(), prog_id, r_dex, sp_mkt, sp_pda,
+            mint, sp_q_vault, TOKEN_PROGRAM_ID, sp_t_mint, sp_t_escrow, TOKEN_PROGRAM_ID, None,
+            sp_bump, 0, 32, 100, 1_000,
         ), &payer, &[&payer, &sp_creator]);
         // Accrue exact 200 micro-USDC trade fee (`qty = 1_000` @ $100 -> notional = 100_000 -> 10 bps fee = 100 each -> fee2 = 200)
         let sp_l = Keypair::new(); let sp_s = Keypair::new();
