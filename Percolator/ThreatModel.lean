@@ -174,6 +174,35 @@ theorem threat_bug1c_bankrupt_liquidation_forces_full_close
     · exact Or.inr (Or.inl h2)
   simp [hc]
 
+/-- **THEOREM (`threat_tradeReduce_unbounded_qty_overcloses`)**:
+    Why `Trade(mode = 1)` must bound `qty` by the closing legs' size: on a healthy side
+    (`oiSide = rawSide`), `proportionalRawReduction` clamps the raw reduction to the leg's own
+    `rawLeg`, so any `qty > rawLeg` removes `qty` from `oiSide` but only `rawLeg` from `rawSide`
+    (the gap is other portfolios' open interest). -/
+theorem threat_tradeReduce_unbounded_qty_overcloses (qty rawLeg oiSide : Nat)
+    (hoi : 0 < oiSide) (hgt : rawLeg < qty) :
+    proportionalRawReduction qty rawLeg oiSide oiSide = rawLeg ∧ rawLeg < qty := by
+  unfold proportionalRawReduction
+  have hne : ¬ (oiSide = 0 ∨ oiSide = 0) := by omega
+  rw [ite_eq_right_of_eq_false _ _ (eq_false hne), ite_eq_left_of_eq_true _ _ (eq_true rfl)]
+  exact ⟨by omega, hgt⟩
+
+/-- **THEOREM (`threat_tradeReduce_bounded_qty_keeps_adl_one`)**:
+    With the bound `qty ≤ rawLeg` (`Spec.stepTradeReduce`, `Program.tradeCore` mode 1), a healthy
+    side (`oiSide = rawSide`) loses exactly `qty` of BOTH open interest and raw basis, and its
+    derived ADL index stays `ADL_ONE` (no other portfolio's position is touched). -/
+theorem threat_tradeReduce_bounded_qty_keeps_adl_one (qty rawLeg oiSide : Nat)
+    (hoi : 0 < oiSide) (hq : qty ≤ rawLeg) :
+    proportionalRawReduction qty rawLeg oiSide oiSide = qty ∧
+    deriveAdl (oiSide - qty) (oiSide - qty) = adlOneNat := by
+  unfold proportionalRawReduction deriveAdl
+  have hne : ¬ (oiSide = 0 ∨ oiSide = 0) := by omega
+  rw [ite_eq_right_of_eq_false _ _ (eq_false hne), ite_eq_left_of_eq_true _ _ (eq_true rfl)]
+  refine ⟨by omega, ?_⟩
+  by_cases h0 : oiSide - qty = 0
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true h0)]
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false h0), ite_eq_left_of_eq_true _ _ (eq_true (Nat.le_refl _))]
+
 /-- **THEOREM (`threat_gapA_fronting_bad_debt_writeoff_order_independent`)**:
     **Generalized Gap A Closure (`insFronted` Bad-Debt Write-Off Across All 5 Settlement Callers)**:
     Suppose winner profit `gain = loss` and loser has `cap < loss` (bad debt `sf = loss - cap > 0`),

@@ -446,7 +446,8 @@ def stepTradeOpen (st : DexState) (mid pidL pidS qty spreadLToS spreadSToL : Nat
   else none
 
 /-- Bilateral risk-reducing trade on Market `mid` (works in `Active` & `WindDown`, bypasses IM,
-    uses proportional raw-basis reduction on ADL-haircutted sides!). -/
+    uses proportional raw-basis reduction on ADL-haircutted sides!). `qty` never exceeds either
+    closing leg's `rawBasis` (`Program.tradeCore` bounds it by the tighter `legCloseCapU64`). -/
 def stepTradeReduce (st : DexState) (mid pidL pidS qty : Nat) : Option DexState := do
   if pidL = pidS then none
   let m ← st.markets mid
@@ -456,7 +457,8 @@ def stepTradeReduce (st : DexState) (mid pidL pidS qty : Nat) : Option DexState 
   let lS ← pS.legs mid
   if (m.status = .active ∨ m.status = .windDown) ∧ qty > 0 ∧
      lL.side = .long ∧ lS.side = .short ∧
-     m.oiLong ≥ qty ∧ m.oiShort ≥ qty then
+     m.oiLong ≥ qty ∧ m.oiShort ≥ qty ∧
+     qty ≤ lL.rawBasis ∧ qty ≤ lS.rawBasis then
     let redL := proportionalRawReduction qty lL.rawBasis m.rawBasisLong m.oiLong
     let redS := proportionalRawReduction qty lS.rawBasis m.rawBasisShort m.oiShort
     if m.rawBasisLong < redL ∨ m.rawBasisShort < redS then none

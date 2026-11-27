@@ -1029,6 +1029,23 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     addU64At mData MktOff.rewardAccrued  rewFee
     addU64At dData DexOff.totalRewards   rewFee
 
+/-- Exact effective close-out quantity for `pflData`'s leg on `mid` if it holds `targetSide`:
+    returns `0` if flat/absent/opposite side, else `min oiSide (ceil(rLeg * oiSide / rawSide))`
+    so closing `closeCap` zeroes `rawBasis` completely even under arbitrary post-ADL ratios! -/
+def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : SolanaM UInt64 := do
+  let slot ← findLegLoop pflData mid 0
+  if slot >= MAX_LEGS then return 0
+  let lp := legPtrAt pflData slot
+  if (← loadU8 lp LegOff.side) != targetSide then return 0
+  let rLeg ← loadU64 lp LegOff.rawBasis
+  if rLeg == 0 then return 0
+  let oiSide  ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.oiLong else MktOff.oiShort)
+  let rawSide ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.rawBasisLong else MktOff.rawBasisShort)
+  if oiSide == 0 || rawSide == 0 then return 0
+  if oiSide == rawSide then return (if rLeg < oiSide then rLeg else oiSide)
+  let q ← mulDiv64Ceil rLeg oiSide rawSide
+  return (if q < oiSide then q else oiSide)
+
 /-- Shared core bilateral trade execution (used identically by `Trade` and CPI-Out `TradeWithMatcher`).
     Takes 5 pointer args (`argsPtr` = `[mktKeyPtr:u64, mode:u64, qty:u64, execPrice:u64]`) so both
     paths share 100% identical conservation, `maxMoveBps` spread clamping, fee splitting, and margin checks. -/
@@ -1129,7 +1146,12 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
 
     let oiL ← loadU64 mData MktOff.oiLong
     let oiS ← loadU64 mData MktOff.oiShort
-    SolanaM.require (qty <= oiL && qty <= oiS) PErr.invalidParams
+    -- `proportionalRawRedU64` clamps each leg's raw reduction to its own `rawBasis`, so `qty` must
+    -- also be bounded by BOTH legs' effective close-out size: otherwise two tiny legs could remove
+    -- other portfolios' open interest from `oiLong`/`oiShort` without their raw basis.
+    let capL ← legCloseCapU64 mData fLData mid SIDE_LONG
+    let capS ← legCloseCapU64 mData fSData mid SIDE_SHORT
+    SolanaM.require (qty <= oiL && qty <= oiS && qty <= capL && qty <= capS) PErr.invalidParams
 
     let rLegL ← loadU64 lpL LegOff.rawBasis
     let rLegS ← loadU64 lpS LegOff.rawBasis
@@ -1249,23 +1271,6 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
   else
     SolanaM.fail PErr.invalidParams
   log64 EvtTag.trade ((mid <<< 8) ||| mode.toUInt64) qty execPrice (← loadU64 mData MktOff.markPrice)
-
-/-- Exact effective close-out quantity for `pflData`'s leg on `mid` if it holds `targetSide`:
-    returns `0` if flat/absent/opposite side, else `min oiSide (ceil(rLeg * oiSide / rawSide))`
-    so closing `closeCap` zeroes `rawBasis` completely even under arbitrary post-ADL ratios! -/
-def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : SolanaM UInt64 := do
-  let slot ← findLegLoop pflData mid 0
-  if slot >= MAX_LEGS then return 0
-  let lp := legPtrAt pflData slot
-  if (← loadU8 lp LegOff.side) != targetSide then return 0
-  let rLeg ← loadU64 lp LegOff.rawBasis
-  if rLeg == 0 then return 0
-  let oiSide  ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.oiLong else MktOff.oiShort)
-  let rawSide ← loadU64 mData (if targetSide == SIDE_LONG then MktOff.rawBasisLong else MktOff.rawBasisShort)
-  if oiSide == 0 || rawSide == 0 then return 0
-  if oiSide == rawSide then return (if rLeg < oiSide then rLeg else oiSide)
-  let q ← mulDiv64Ceil rLeg oiSide rawSide
-  return (if q < oiSide then q else oiSide)
 
 /-- Mode 4 (`Trade` & `TradeWithMatcher`): Atomic Auto-Netted Buy/Sell + Position Flip!
     `fBuyer` buys `qty` from `fSeller` at `execPrice` regardless of either side's existing position
