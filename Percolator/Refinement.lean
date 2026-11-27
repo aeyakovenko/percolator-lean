@@ -3696,7 +3696,7 @@ theorem oracleClampedStepCore_refines_spec
             let stp := if raw < maxAllowed then raw else maxAllowed
             if oldP > stp then (oldP - stp, stp) else (1, oldP - 1)
         let remBudget := if maxAllowed >= step then maxAllowed - step else 0
-        let f ← if feedPrice != np && remBudget > 0 && fundBps > 0 then do
+        let f ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
             let rawF ← mulDiv64 oldP fundBps BPS_DEN
             pure (if rawF < remBudget then rawF else remBudget)
           else pure 0
@@ -3765,7 +3765,7 @@ theorem oracleClampedStepCore_refines_spec
       show (if maxAllowed ≥ step then maxAllowed - step else 0).toNat = _
       have hge : maxAllowed ≥ step := UInt64.le_iff_toNat_le.mpr hstpLe
       rw [ite_eq_left_of_eq_true _ _ (eq_true hge), u64_sub_toNat_of_le _ _ hstpLe]
-    by_cases hfc : ((feedPrice != np) && decide (remBudget > 0) && decide (fundBps > 0)) = true
+    by_cases hfc : ((feedPrice != oldP) && decide (remBudget > 0) && decide (fundBps > 0)) = true
     · rw [ite_eq_left_of_eq_true _ _ (eq_true hfc)] at h
       unfold SolanaM.bind at h
       cases hrf : mulDiv64 oldP fundBps BPS_DEN s1 with

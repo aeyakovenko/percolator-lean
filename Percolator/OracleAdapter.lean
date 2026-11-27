@@ -283,6 +283,27 @@ theorem ewma_ratio_crank_within_clamp
   dsimp only
   exact crank_step_and_funding_within_clamp oldP _ maxMoveBps fundBps ho
 
+/-- Formal Proof #8 (Premium Funding Guard Is Reachable):
+    `handleCrank` funds when the feed differs from the PRE-step mark `oldP` and clamp budget is left.
+    Whenever the step toward `targetP ≠ oldP` is unclamped (`|targetP - oldP| < maxAllowed`), that
+    budget `maxAllowed - step` is strictly positive, so funding is emitted. (Comparing the feed against
+    the POST-step `newP` instead never funds: an unclamped step lands exactly on `targetP`.) -/
+theorem crank_funding_budget_pos_on_unclamped_premium (oldP targetP maxMoveBps : Nat)
+    (_hne : targetP ≠ oldP) (ht : 1 ≤ targetP)
+    (hlt : (if targetP ≥ oldP then targetP - oldP else oldP - targetP) < (oldP * maxMoveBps) / 10_000) :
+    0 < (oldP * maxMoveBps) / 10_000 - (clampedStepNat oldP targetP maxMoveBps).2 ∧
+    (clampedStepNat oldP targetP maxMoveBps).1 = targetP := by
+  unfold clampedStepNat
+  by_cases hge : targetP ≥ oldP
+  · rw [ite_eq_left_of_eq_true _ _ (eq_true hge)] at hlt ⊢
+    simp only [Nat.min_def]
+    split <;> omega
+  · rw [ite_eq_right_of_eq_false _ _ (eq_false hge)] at hlt ⊢
+    have hgt : oldP > min (oldP - targetP) (oldP * maxMoveBps / 10_000) := by omega
+    rw [ite_eq_left_of_eq_true _ _ (eq_true hgt)]
+    simp only [Nat.min_def]
+    split <;> omega
+
 /-! ### Exact 128-bit & Decimal Scaling Helpers -/
 
 private def div128StepLoop (rem lo q denom : UInt64) (steps : UInt64) : UInt64 :=
@@ -694,10 +715,12 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   -- Compute on-chain premium funding strictly within remaining clamp budget
   let remBudget := if maxAllowed >= step then maxAllowed - step else 0
   let fundBps ← loadU64 aData AdpOff.fundingBpsPerStep
-  let (fundSign, fundE6) ← if feedPrice != newP && remBudget > 0 && fundBps > 0 then do
+  -- Premium = feed vs the pre-step mark `oldP` (`newP == feedPrice` whenever the step is unclamped,
+  -- and `remBudget == 0` whenever it is clamped, so comparing against `newP` never funded).
+  let (fundSign, fundE6) ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
       let rawF ← mulDiv64 oldP fundBps BPS_DEN
       let f := if rawF < remBudget then rawF else remBudget
-      let sign : UInt8 := if newP > feedPrice then 0 else 1
+      let sign : UInt8 := if oldP > feedPrice then 0 else 1
       pure (sign, f)
     else pure (0, 0)
 
