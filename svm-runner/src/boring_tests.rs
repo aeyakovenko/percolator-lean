@@ -2793,7 +2793,21 @@ pub fn test_21_issue107_partial_liq_post_fee_solvency(elf: &[u8]) {
     assert_eq!(read_u64(&e.svm, &btc, 224), 50 * POS_SCALE, "ZERO insurance drawn!");
     e.refresh(btc, &bob);
     e.check("t21-issue107-after-full-liq");
-    println!("       [t21] Issue #107 regression verified: partial liq leaving zombie/under-MM leg rejected (103), full liq 0 insDraw!");
+    // PR #10 regression: wrapping `liqFeeBps` (mod 2^64) & `liqFeeBps > mmBps` MUST be rejected (`Custom(103)`)!
+    let bad_wrap_mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let wrap_admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    for bad_liq_fee in [501u64, u64::MAX - 10, (u64::MAX / 400) + 1] {
+        send_err_custom(
+            &mut e.svm,
+            ix_create_market(
+                e.prog_id, e.dex, bad_wrap_mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(), wrap_admin_tok, e.fee_vault,
+                100 * POS_SCALE, 10, 50, 0, 1000, 500, bad_liq_fee, 0, 75, 2500, 1_000_000 * POS_SCALE,
+            ),
+            &e.payer, &[&e.payer, &e.admin], 103,
+            "PR #10: CreateMarket must reject liqFeeBps > mmBps / u64 wraparound (Custom 103)",
+        );
+    }
+    println!("       [t21] Issue #107 + PR #10 regression verified: wrapping liqFeeBps rejected (103), zombie partial liq rejected (103), full liq 0 insDraw!");
 }
 
 /// Test 22: Issue #110 & #109 Multi-Leg Regression — Self-Made Market Overflow DoS & 2-Bankrupt-Leg Deadlock Blocked!

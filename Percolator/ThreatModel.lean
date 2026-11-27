@@ -1658,4 +1658,22 @@ theorem threat_pure_adl_outage_zero_ins_drain_and_unclamped_close_safe
   have hle := haircutPayout_le_residual totPnlShort rPoolShort totPnlShort
   omega
 
+/-- **THREAT PROOF 23 (`threat_createMarket_liqFeeBps_no_u64_wraparound` — Closes PR #10 `liqFeeBps` Wraparound)**:
+    Enforcing `liqFeeBps ≤ mmBps < 10_000` and `maxMoveBps ≤ 1_500` before computing `k5MoveBps` and
+    `liqAtP5` guarantees every intermediate product and sum is strictly `< 2^64`, eliminating `UInt64`
+    modulo-`2^64` wraparound bypasses of the `K+1=5` solvency envelope in `handleCreateMarket`. -/
+theorem threat_createMarket_liqFeeBps_no_u64_wraparound
+    (maxMoveBps liqFeeBps mmBps : Nat)
+    (hMove : maxMoveBps ≤ 1500) (hLiq : liqFeeBps ≤ mmBps) (hMm : mmBps < bpsDenNat) :
+    let k5 := 5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000
+    maxMoveBps * maxMoveBps * 12 + 9999 < 2 ^ 64 ∧
+    liqFeeBps * k5 + 9999 < 2 ^ 64 ∧
+    k5 + (liqFeeBps + (liqFeeBps * k5 + 9999) / 10000) < 2 ^ 64 := by
+  have h1 : maxMoveBps * maxMoveBps ≤ 1500 * 1500 := Nat.mul_le_mul hMove hMove
+  have hk5 : 5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000 ≤ 10200 := by omega
+  have hLiqLt : liqFeeBps < 10000 := by unfold bpsDenNat at hMm; omega
+  have hProd : liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000) ≤ 10000 * 10200 :=
+    Nat.mul_le_mul (Nat.le_of_lt hLiqLt) hk5
+  refine ⟨by omega, by omega, by omega⟩
+
 end Percolator.ThreatModel

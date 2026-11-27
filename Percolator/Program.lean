@@ -682,7 +682,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   -- `k5MoveBps = 5*m + ceil(12*m^2 / 10000)` strictly bounds `((10000+m)^5 - 10000^5) / 10000^4`
   -- for all `m <= 1500`, `liqAtP5 = liqFeeBps + ceil(liqFeeBps * k5MoveBps / 10000)` bounds
   -- `liqFee` computed at post-jump `p5`, AND Gap B (`mmBps + maxMoveBps <= imBps`) blocks same-slot sandwich!
-  SolanaM.require (maxMoveBps <= 1500) PErr.invalidParams
+  SolanaM.require (liqFeeBps <= mmBps && maxMoveBps <= 1500) PErr.invalidParams
   let k5MoveBps := 5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000
   let liqAtP5   := liqFeeBps + (liqFeeBps * k5MoveBps + 9999) / 10000
   SolanaM.require ((← checkedAdd64 k5MoveBps liqAtP5) <= mmBps &&
