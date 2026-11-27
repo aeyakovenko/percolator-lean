@@ -679,31 +679,39 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) PErr.invalidMagic
   let oldP ← loadU64 mData MktOff.markPrice
   let lastSlot ← loadU64 mData MktOff.lastOracleSlot
-  let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
-  let effMaxMove :=
-    if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
-  let maxAllowed ← mulDiv64 oldP effMaxMove BPS_DEN
+  let oiL ← loadU64 mData MktOff.oiLong
+  let oiS ← loadU64 mData MktOff.oiShort
+  let rL  ← loadU64 mData MktOff.rawBasisLong
+  let rS  ← loadU64 mData MktOff.rawBasisShort
+  let isEmpty := oiL == 0 && oiS == 0 && rL == 0 && rS == 0
 
-  -- Clamp price step smoothly toward `feedPrice`
-  let (newP, step) : UInt64 × UInt64 :=
-    if feedPrice >= oldP then
-      let raw := feedPrice - oldP
-      let s := if raw < maxAllowed then raw else maxAllowed
-      (oldP + s, s)
-    else
-      let raw := oldP - feedPrice
-      let s := if raw < maxAllowed then raw else maxAllowed
-      if oldP > s then (oldP - s, s) else (1, oldP - 1)
-
-  -- Compute on-chain premium funding strictly within remaining clamp budget
-  let remBudget := if maxAllowed >= step then maxAllowed - step else 0
-  let fundBps ← loadU64 aData AdpOff.fundingBpsPerStep
-  let (fundSign, fundE6) ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
-      let rawF ← mulDiv64 oldP fundBps BPS_DEN
-      let f := if rawF < remBudget then rawF else remBudget
-      let sign : UInt8 := if oldP > feedPrice then 0 else 1
-      pure (sign, f)
-    else pure (0, 0)
+  -- Fast-snap when market has ZERO open/dead positions (`OI == 0 ∧ rawBasis == 0`),
+  -- otherwise smooth slot-paced clamp (`dt == 1` half-step) + bounded premium funding!
+  let (newP, fundSign, fundE6) : UInt64 × UInt8 × UInt64 ← if isEmpty then
+      pure (feedPrice, 0, 0)
+    else do
+      let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
+      let effMaxMove :=
+        if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+      let maxAllowed ← mulDiv64 oldP effMaxMove BPS_DEN
+      let (np, step) : UInt64 × UInt64 :=
+        if feedPrice >= oldP then
+          let raw := feedPrice - oldP
+          let s := if raw < maxAllowed then raw else maxAllowed
+          (oldP + s, s)
+        else
+          let raw := oldP - feedPrice
+          let s := if raw < maxAllowed then raw else maxAllowed
+          if oldP > s then (oldP - s, s) else (1, oldP - 1)
+      let remBudget := if maxAllowed >= step then maxAllowed - step else 0
+      let fundBps ← loadU64 aData AdpOff.fundingBpsPerStep
+      let (fSign, fE6) ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
+          let rawF ← mulDiv64 oldP fundBps BPS_DEN
+          let f := if rawF < remBudget then rawF else remBudget
+          let sign : UInt8 := if oldP > feedPrice then 0 else 1
+          pure (sign, f)
+        else pure (0, 0)
+      pure (np, fSign, fE6)
 
   -- CPI `percolator::UpdateOracle(mkt[W], oracAuthPda[S])`
   let buf ← stackAlloc 280

@@ -405,11 +405,12 @@ def realizeFrontedPnl (dData mData fData : Ptr) (posPnl rPool totPnl availIns : 
 
 /-- Realize `posPnl` into shared cross-margin `pfl.capital` strictly within `R_m + availIns`:
     1. If `R_m >= P^+_m` (or `forceHaircut`): realize from `R_m` (`0` fronting).
-    2. Else if `status == ACTIVE && adlLong == ADL_ONE && adlShort == ADL_ONE && maxFrontBps > 0`:
-       compute `availIns = floor(I_m * maxFrontBps / BPS_DEN)` and call `realizeFrontedPnl`.
+    2. Else if `status == ACTIVE && adlLong == ADL_ONE && adlShort == ADL_ONE && maxFrontBps > 0`
+       AND NOT inside a saturated outage catch-up ramp (`lastRampSlot == 0 || curSlot > lastRampSlot + RAMP_FRONT_COOLDOWN`):
+       compute `availIns` bounded by cumulative `maxFrontBps` of `I_m + insFronted` and call `realizeFrontedPnl`.
     Strictly contained to market `m`'s own `R_m + I_m` (zero cross-market contagion, exact
-    `V == C + I + R + S`, and `Pfl.capital' >= Pfl.capital` unconditionally)! -/
-def realizeWinnerPnl (dData mData fData : Ptr) (posPnl : UInt64) (forceHaircut : Bool) :
+    `V == C + I + R + S + F`, and `Pfl.capital' >= Pfl.capital` unconditionally)! -/
+def realizeWinnerPnl (dData mData fData : Ptr) (posPnl curSlot : UInt64) (forceHaircut : Bool) :
     SolanaM UInt64 := do
   if posPnl == 0 then return 0
   let rPool  ← loadU64 mData MktOff.realizedPool
@@ -425,7 +426,9 @@ def realizeWinnerPnl (dData mData fData : Ptr) (posPnl : UInt64) (forceHaircut :
     return 0
   else
     let maxFrontBps ← loadU16 mData MktOff.maxFrontBps
-    if maxFrontBps > 0 && totPnl > 0 &&
+    let rampSlot    ← loadU64 mData MktOff.lastRampSlot
+    let notRamping  := rampSlot == 0 || curSlot < rampSlot || (curSlot - rampSlot) > RAMP_FRONT_COOLDOWN
+    if maxFrontBps > 0 && totPnl > 0 && notRamping &&
        (← loadU8 mData MktOff.status) == STATUS_ACTIVE &&
        (← loadU64 mData MktOff.adlLong) == ADL_ONE &&
        (← loadU64 mData MktOff.adlShort) == ADL_ONE then
@@ -558,7 +561,7 @@ def settleAndRefreshLeg (dexData mktData pflData : Ptr) (slotIdx curSlot : UInt6
       shortfall := sf'
     storeU64 lp LegOff.entryK kSide
 
-  posPnl ← realizeWinnerPnl dexData mktData pflData posPnl forceHaircut
+  posPnl ← realizeWinnerPnl dexData mktData pflData posPnl curSlot forceHaircut
 
   storeU64 lp LegOff.posPnl posPnl
   syncLegMargins mktData pflData slotIdx curSlot
@@ -778,27 +781,38 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
 
   let oldPrice ← loadU64 mData MktOff.markPrice
   let diff := if newPrice >= oldPrice then newPrice - oldPrice else oldPrice - newPrice
-  -- Half-step pacing on consecutive 1-slot updates (`dt == 1`): doubles worst-case censorship
-  -- resistance across BOTH existing live markets & new markets (5-slot & 8-slot double-leader
-  -- censorship stay strictly within `mmBps` with 0 bad debt, while `dt >= 2` keeps full `maxMoveBps`!).
-  let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
-  let effMaxMove :=
-    if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
-  let maxAllowed ← mulDiv64 oldPrice effMaxMove BPS_DEN
-  SolanaM.require ((← checkedAdd64 diff fundE6) <= maxAllowed) PErr.oracleClamp
+  let oiL  ← loadU64 mData MktOff.oiLong
+  let oiS  ← loadU64 mData MktOff.oiShort
+  let rL   ← loadU64 mData MktOff.rawBasisLong
+  let rS   ← loadU64 mData MktOff.rawBasisShort
+  let isEmpty := oiL == 0 && oiS == 0 && rL == 0 && rS == 0
+  if isEmpty then
+    -- Empty market fast-snap: once all positions have closed out (`OI == 0 ∧ rawBasis == 0`),
+    -- snap `markPrice` directly to live spot in 1 slot (requiring `fundE6 == 0`) and clear ramp pause!
+    SolanaM.require (fundE6 == 0) PErr.oracleClamp
+    storeU64 mData MktOff.lastRampSlot 0
+  else
+    -- Loaded market paced clamp (`dt == 1` half-step pacing): doubles censorship resistance
+    -- (5-slot & 8-slot double-leader censorship stay within `mmBps` with 0 bad debt, while `dt >= 2`
+    -- keeps full `maxMoveBps`). Saturated ramp ticks (`diff >= 75%` of `maxAllowed`) stamp
+    -- `lastRampSlot = curSlot` to pause new `I_m` fronting during outage catch-up without blocking trades!
+    let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
+    let effMaxMove :=
+      if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+    let maxAllowed ← mulDiv64 oldPrice effMaxMove BPS_DEN
+    SolanaM.require ((← checkedAdd64 diff fundE6) <= maxAllowed) PErr.oracleClamp
+    let rampThresh := maxAllowed - (maxAllowed >>> 2)
+    if maxAllowed > 0 && diff >= rampThresh then
+      storeU64 mData MktOff.lastRampSlot curSlot
 
   -- Gap #4B Fix (Exact Asymmetric-ADL Zero-Sum Oracle Settlement):
   -- Winning side uses floored `adlW * diff / ADL_ONE` (`rawW * ΔkW ≤ oiW * diff`).
   -- Losing side uses ceiled `oiL * diff / rawL` (`rawL * ΔkL ≥ oiL * diff`), guaranteeing
   -- `∑ gain ≤ ∑ loss` for EVERY asymmetric post-ADL ratio `(oi, rawL, rawS)` and EVERY `diff`!
-  let oiL  ← loadU64 mData MktOff.oiLong
-  let oiS  ← loadU64 mData MktOff.oiShort
   let maxOiCur := if oiL > oiS then oiL else oiS
   if maxOiCur > 0 then
     let curNot ← mulDiv64Ceil maxOiCur newPrice POS_SCALE
     SolanaM.require (curNot <= MAX_MKT_NOTIONAL) PErr.oiLimitExceeded
-  let rL   ← loadU64 mData MktOff.rawBasisLong
-  let rS   ← loadU64 mData MktOff.rawBasisShort
   let adlL ← loadU64 mData MktOff.adlLong
   let adlS ← loadU64 mData MktOff.adlShort
   if newPrice > oldPrice then
@@ -1060,15 +1074,21 @@ def handleRefreshLeg (input : Ptr) : SolanaM Unit := do
   let _ ← settleAndRefreshLeg dData mData fData slotIdx curSlot forceHaircut false
   freeLegIfEmpty fData slotIdx
 
-/-- Apply optional bounded `execPrice` spread transfer directly between Long & Short `capital`.
-    Preserves `C_tot` identically and allows external CLOB/AMM/matcher CPIs with real spreads! -/
-def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64) : SolanaM Unit := do
+/-- Apply optional `execPrice` spread transfer directly between Long & Short `capital`.
+    Preserves `C_tot` identically and allows external CLOB/AMM/matcher CPIs with real spreads!
+    - `clampSpread = true` (`mode = 0`, `mode = 2/3`, or `limitPrice == 0` matcher closes):
+      enforces `|execPrice - markP| <= maxMoveBps` (blocks margin-stripping & unbounded matcher fills).
+    - `clampSpread = false` (bilateral signed `mode = 1` closes & limit-guarded `TradeWithMatcher` closes):
+      allows users to reprice and exit OI immediately at the real price during oracle catch-up ramps! -/
+def applyExecSpread (mData fLData fSData : Ptr) (qty execPrice : UInt64)
+    (clampSpread : Bool := true) : SolanaM Unit := do
   if execPrice == 0 then return ()
   let markP ← loadU64 mData MktOff.markPrice
   if execPrice == markP then return ()
   let diff := if execPrice > markP then execPrice - markP else markP - execPrice
-  let maxSlip ← mulDiv64 markP (← loadU64 mData MktOff.maxMoveBps) BPS_DEN
-  SolanaM.require (diff <= maxSlip) PErr.execPriceClamp
+  if clampSpread then
+    let maxSlip ← mulDiv64 markP (← loadU64 mData MktOff.maxMoveBps) BPS_DEN
+    SolanaM.require (diff <= maxSlip) PErr.execPriceClamp
   let spread ← mulDiv64Ceil qty diff POS_SCALE
   if spread > 0 then
     if execPrice > markP then
@@ -1100,10 +1120,11 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     Takes 5 pointer args (`argsPtr` = `[mktKeyPtr:u64, mode:u64, qty:u64, execPrice:u64]`) so both
     paths share 100% identical conservation, `maxMoveBps` spread clamping, fee splitting, and margin checks. -/
 @[noinline] def tradeCore (dData mData fLData fSData argsPtr : Ptr) : SolanaM Unit := do
-  let mktKeyPtr ← loadU64 argsPtr 0
-  let mode      ← loadU8  argsPtr 8
-  let qty       ← loadU64 argsPtr 16
-  let execPrice ← loadU64 argsPtr 24
+  let mktKeyPtr      ← loadU64 argsPtr 0
+  let mode           ← loadU8  argsPtr 8
+  let allowWideClose ← loadU8  argsPtr 9
+  let qty            ← loadU64 argsPtr 16
+  let execPrice      ← loadU64 argsPtr 24
   SolanaM.require (qty > 0) PErr.invalidParams
 
   let st ← loadU8 mData MktOff.status
@@ -1178,9 +1199,10 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     requirePortfolioIm fLData curSlot
     requirePortfolioIm fSData curSlot
   else if mode == 1 then
-    -- Mode 1: Bilateral risk-reducing close (works in Active & WindDown, post-ADL proportional!)
+    -- Mode 1: Bilateral risk-reducing close (works in Active & WindDown, post-ADL proportional,
+    -- AND even if the oracle is stale! Pure OI reduction never creates new risk, so consenting
+    -- Long & Short can always voluntarily trade out at the real price without killing the market!)
     SolanaM.require (st == STATUS_ACTIVE || st == STATUS_WINDDOWN) PErr.invalidStatus
-    if st == STATUS_ACTIVE then checkOracleFresh mData curSlot
 
     let slotL ← findLegLoop fLData mid 0
     let slotS ← findLegLoop fSData mid 0
@@ -1245,7 +1267,9 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     -- Mode 1 reduce: `fL` is SELLING to close its Long and `fS` is BUYING to close its Short!
     --   * Ask (`execPrice > markP`): buyer `fS` pays spread to seller `fL`
     --   * Bid (`execPrice < markP`): seller `fL` pays spread to buyer `fS`
-    applyExecSpread mData fSData fLData qty execPrice
+    -- Unclamped when `allowWideClose != 0` (bilateral signed `Trade` or explicit `limitPrice > 0`
+    -- matcher close): lets users trade out OI immediately at the real price during outage ramps!
+    applyExecSpread mData fSData fLData qty execPrice (allowWideClose == 0)
     let markP ← loadU64 mData MktOff.markPrice
     if execPrice != 0 && execPrice != markP then
       if execPrice > markP then
@@ -1351,9 +1375,10 @@ def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : S
     (`applyExecSpread mData fBuyer fSeller`), preserving 5-bucket conservation `C+I+R+S+F=V`,
     per-market isolation, WindDown safety, and cross-margin IM/MM bounds! -/
 @[noinline] def tradeNettedCore (dData mData fBuyer fSeller argsPtr : Ptr) : SolanaM Unit := do
-  let mktKeyPtr ← loadU64 argsPtr 0
-  let qty       ← loadU64 argsPtr 16
-  let execPrice ← loadU64 argsPtr 24
+  let mktKeyPtr      ← loadU64 argsPtr 0
+  let allowWideClose ← loadU8  argsPtr 9
+  let qty            ← loadU64 argsPtr 16
+  let execPrice      ← loadU64 argsPtr 24
   SolanaM.require (qty > 0) PErr.invalidParams
   let mid ← loadU64 mData MktOff.marketId
   let closeB ← legCloseCapU64 mData fBuyer  mid SIDE_SHORT
@@ -1365,6 +1390,7 @@ def legCloseCapU64 (mData pflData : Ptr) (mid : UInt64) (targetSide : UInt8) : S
   storeU64 subArgs 24 execPrice
   if cBoth > 0 then
     storeU64 subArgs 8  1
+    storeU8  subArgs 9  allowWideClose
     storeU64 subArgs 16 cBoth
     tradeCore dData mData fSeller fBuyer subArgs
   let rem1 := qty - cBoth
@@ -1415,9 +1441,11 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
   let mode      ← loadU8  ix.ptr 1
   let qty       ← loadU64 ix.ptr 2
   let execPrice ← if ix.len >= 18 then loadU64 ix.ptr 10 else pure 0
+  SolanaM.require (execPrice <= MAX_PRICE) PErr.invalidParams
   let args ← stackAlloc 32
   storeU64 args 0  (AccountView.keyPtr mkt)
   storeU64 args 8  mode.toUInt64
+  storeU8  args 9  1
   storeU64 args 16 qty
   storeU64 args 24 execPrice
   if mode == 4 then
@@ -1531,30 +1559,10 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
     tokenTransferCheckedSigned tokProg vaultPda mint liqTok vaultPda liqFee dec
       TAG_DEX_VAULT (AccountView.keyPtr dex) bump
 
-  -- Windowed cumulative draw cap from THIS market's isolated insurance `I_m` into `R_m` ONLY when BOTH
-  -- `freeCap == 0` AND `legLock == 0`: enforces `∑ spentBps <= maxInsDrawBps` across ALL liquidations
-  -- in any `INS_DRAW_WINDOW_SLOTS` (~1h) window using ceiling bps (blocks #113 N-pair split drains!).
-  if shortfall > 0 && freeCap == 0 && legLock == 0 then
-    let ins ← loadU64 mData MktOff.insurance
-    let maxDrawBps ← loadU64 mData MktOff.maxInsDrawBps
-    let winId32 := (curSlot / INS_DRAW_WINDOW_SLOTS).toUInt32
-    let storedWin ← loadU32 mData MktOff.insDrawWinId
-    let usedBps0 ← loadU16 mData MktOff.insDrawUsedBps
-    let usedBps := if storedWin == winId32 then usedBps0.toUInt64 else 0
-    let remBps := if maxDrawBps > usedBps then maxDrawBps - usedBps else 0
-    let maxDraw ← mulDiv64 ins remBps BPS_DEN
-    let draw1 := if shortfall < maxDraw then shortfall else maxDraw
-    let insDraw := if draw1 < ins then draw1 else ins
-    if insDraw > 0 then
-      let spentBps ← mulDiv64Ceil insDraw BPS_DEN ins
-      let nextUsed0 := usedBps + spentBps
-      let nextUsed := if nextUsed0 < maxDrawBps then nextUsed0 else maxDrawBps
-      storeU16 mData MktOff.insDrawUsedBps nextUsed.toUInt16
-      storeU32 mData MktOff.insDrawWinId   winId32
-      subU64At mData MktOff.insurance      insDraw
-      subU64At dData DexOff.totalInsurance insDraw
-      addU64At mData MktOff.realizedPool   insDraw
-      addU64At dData DexOff.totalResidual  insDraw
+  -- Pure ADL on bankruptcy (`0` direct `I_m` bankruptcy draw!):
+  -- `I_m` is strictly reserved for async cross-backing (`insFronted`, paused during outage ramps).
+  -- Any unrecoverable bankruptcy shortfall goes 100% to exact proportional ADL (`deriveAdlU64`),
+  -- making #113 N-pair self-trade insurance extraction provably $0 under any outage!
 
   if mode == 1 then
     -- Tier 1/2 Transparent HLP / Counterparty Takeover (**ZERO ADL!**)
@@ -2108,6 +2116,7 @@ def settleMatcherOffersLoop (dData takerData lpData ctxBuf : Ptr) (i : UInt64) :
       let fSData := if takerIsLong != 0 then lpData    else takerData
       storeU64 argsBuf 0  (AccountView.keyPtr mkt)
       storeU64 argsBuf 8  mode.toUInt64
+      storeU8  argsBuf 9  (if limitPrice != 0 then 1 else 0)
       storeU64 argsBuf 16 fillQty
       storeU64 argsBuf 24 execPrice
       if mode == 4 then

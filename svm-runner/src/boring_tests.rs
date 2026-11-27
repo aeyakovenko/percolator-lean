@@ -1816,10 +1816,15 @@ pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
 
     // MKT_A moves +3% ($100 -> $103): Alice gains +$30, Bob loses -$30.
     // Crucially: Bob does NOT refresh yet -> R_A == 0!
+    // During the saturated ramp cooldown (`curSlot <= lastRampSlot + 2`), fronting is paused;
+    // once 3 calm slots pass, Alice refreshes FIRST and I_A fronts exact $30 into Alice.capital!
     e.update_oracle(mkt_a, 103 * POS_SCALE, 0, 0);
     assert_eq!(read_u64(&e.svm, &mkt_a, 216), 0, "R_A must be 0 before Bob refreshes");
+    e.refresh(mkt_a, &alice);
+    assert_eq!(read_u64(&e.svm, &mkt_a, 232), 0, "Fronting paused during saturated oracle ramp cooldown!");
+    e.advance_slot(3);
 
-    // Alice refreshes FIRST: I_A fronts exact $30 into Alice.capital ($100 -> $130)!
+    // After ramp cooldown expires: Alice refreshes -> I_A fronts exact $30 into Alice.capital ($100 -> $130)!
     e.refresh(mkt_a, &alice);
     assert_eq!(e.capital(&alice), 130 * POS_SCALE, "Alice must receive $30 fronted from I_A immediately!");
     assert_eq!(read_u64(&e.svm, &mkt_a, 224), 20 * POS_SCALE, "I_A cash must drop $50 -> $20");
@@ -1876,6 +1881,7 @@ pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
         e.update_oracle(mkt_a, 107 * POS_SCALE, 0, 0);
         e.update_oracle(mkt_a, 111 * POS_SCALE, 0, 0);
         e.update_oracle(mkt_a, 115 * POS_SCALE, 0, 0);
+        e.advance_slot(3); // past ramp cooldown so fronting is active
         // Winner fronts $120 from I_A FIRST!
         e.refresh(mkt_a, &a_win);
         assert_eq!(e.capital(&a_win), 230 * POS_SCALE, "Winner fronted exact $120");
@@ -1913,6 +1919,7 @@ pub fn test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(elf: &[u8]) {
         e.trade(cap_mkt, &w1, &l1, 0, 10 * POS_SCALE); // w1 Long 10 vs l1
         e.trade(cap_mkt, &w2, &l2, 0, 10 * POS_SCALE); // w2 Long 10 vs l2 (distinct unrefreshed losers!)
         e.update_oracle(cap_mkt, 105 * POS_SCALE, 0, 0); // +$50 each for w1 & w2; neither loser settled!
+        e.advance_slot(3); // past ramp cooldown so fronting is active
         e.refresh(cap_mkt, &w1);
         assert_eq!(e.capital(&w1), 250 * POS_SCALE, "w1 fronts exact $50 (= 25% of $200 NAV)");
         assert_eq!(read_u64(&e.svm, &cap_mkt, 224), 150 * POS_SCALE, "I_m cash drops $200 -> $150");
@@ -2679,6 +2686,7 @@ pub fn test_20_pr8_bankrupt_settlement_blocked_regression(elf: &[u8], matcher_el
 
     // Step 2: 7 consecutive 1% pumps ($100 -> $107.20) on `mkt` with ZERO liquidations on `bob` (7-slot outage > K=4!)
     e.update_oracle(mkt, 107_200_000, 0, 0);
+    e.advance_slot(3); // advance past ramp cooldown so fronting activates and tests PR #8 bankrupt write-off block!
 
     // Alice refreshes first -> I_m fronts exact $7.20 into Alice's freeCap!
     e.refresh(mkt, &alice);
@@ -2989,7 +2997,7 @@ pub fn test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf: &[u8]) {
     // Crash -12% ($100 -> $88) with zero keepers
     e.update_oracle(mkt, 88 * POS_SCALE, 0, 0);
 
-    // Liquidate all 10 bankrupt longs in the SAME window!
+    // Liquidate all 10 bankrupt longs: under Pure ADL on bankruptcy, EVERY SINGLE LEG draws EXACT 0 from I_m!
     let mut zero_draw_legs = 0usize;
     for (l, _) in &pairs {
         let pre = read_u64(&e.svm, &mkt, 224);
@@ -3000,22 +3008,703 @@ pub fn test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf: &[u8]) {
         }
     }
     let ins_after_10 = read_u64(&e.svm, &mkt, 224);
-    let total_drawn = ins_before_10 - ins_after_10;
-    let max_window_draw = ((ins_before_10 as u128 * 2500) / 10_000) as u64;
-    assert!(
-        total_drawn <= max_window_draw,
-        "#113 windowed cap violated: 10-pair drain took {} > 25% cap {} (ins {} -> {})!",
-        total_drawn, max_window_draw, ins_before_10, ins_after_10
-    );
-    assert!(zero_draw_legs >= 8, "Pairs 2..9 MUST draw exact 0 once 25% window cap is hit (zero_draw_legs={})!", zero_draw_legs);
-    assert_eq!(read_u16(&e.svm, &mkt, 152), 2500, "MktOff.insDrawUsedBps saturated at maxInsDrawBps (2500)!");
-    e.check("t24-issue113-windowed-cap");
-    println!("       [t24] Issue #113 + 8-slot censorship verified: 8-slot censor=0 draw; 10-pair -12% drain capped at {}/{} uUSDC ({} zero-draw legs)!",
-        total_drawn, max_window_draw, zero_draw_legs);
+    assert_eq!(ins_after_10, ins_before_10, "#113 Pure-ADL invariant: 10-pair self-trade bankruptcy MUST draw EXACT 0 from I_m!");
+    assert_eq!(zero_draw_legs, 10, "ALL 10 bankrupt legs MUST draw exact 0 from I_m!");
+    e.check("t24-issue113-pure-adl-zero-draw");
+    println!("       [t24] Issue #113 + 8-slot censorship verified: 8-slot censor=0 draw; 10-pair -12% Pure-ADL drain = 0 uUSDC (10/10 zero-draw legs)!");
 }
 
-/// Runs all 24 boring everyday exchange + security + HL limit-order matcher LiteSVM tests as Suite 12.
-pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8]) {
+/// Test 25: Full Network Outage Simulation (12-Hour Solana Halt + 30-Min Oracle/Keeper Outage)!
+///   Tests ALL 5 real-world outage recovery guarantees end-to-end:
+///     1. 12-hour Solana halt (`unix_timestamp += 43_200`, `slot += 1`) with -20% Pyth V2 spot crash (`$100 -> $80`):
+///        - `StartWindDown` is NOT falsely tripped (Solana `Clock.slot` freezes during a halt!).
+///        - `OracleAdapter` cranks paced step 1 (`$100 -> $99.50` / `$99.00`), stamping `MktOff.lastRampSlot`.
+///        - New `I_m` fronting is AUTOMATICALLY PAUSED during the saturated catch-up ramp (`insFronted == 0`, `I_m` untouched!).
+///     2. Voluntary real-price repricing exit on slot 1 of restart (ZERO trade blocking!):
+///        - Long & Short voluntarily close via `Trade(mode = 4, execPrice = $82.00)` (-17% below lagging mark `$99.00`!):
+///          auto-routed to unclamped `mode = 1` → 0 bad debt, 0 keeper fee, 0 ADL, 0 `I_m` draw!
+///        - Attempting `Trade(mode = 0, execPrice = $82.00)` OR `Trade(mode = 2, execPrice = $82.00)` REJECTED `Custom(130)` (blocks margin-stripping!).
+///        - Limit-guarded `TradeWithMatcher(mode = 4, limitPrice = $80)` via `LimitMatcher` closes at `$82.00` cleanly,
+///          while `limitPrice = 0` stays safely clamped (`Custom(130)`).
+///     3. Instant 1-slot oracle snap when `OI == 0`:
+///        - The moment the last position exits (`OI == 0`), `OracleAdapter.Crank` snaps `markPrice` straight from
+///          `$99.00 -> $80.00` in ONE SINGLE SLOT and clears `lastRampSlot = 0`!
+///        - Normal async `I_m` cross-backing fronting immediately resumes on the next calm tick!
+///     4. 30-minute oracle/keeper outage (`+4,500` slots < `maxStaleness = 9,000`) + catastrophic zero-keeper -12% crash
+///        + `#113` 10-pair self-trade bankruptcy:
+///        - Market stays `Active` (`StartWindDown` rejected), fronting stays paused throughout the ramp, and
+///          Pure ADL absorbs 100% of bad debt onto the attacker's own Shorts (`I_m` loss == EXACT `$0`!).
+pub fn test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(
+    elf: &[u8],
+    limit_matcher_elf: &[u8],
+    adapter_elf: &[u8],
+) {
+    let mut e = BoringEnv::new(elf);
+    let lm_prog  = Keypair::new().pubkey();
+    let adp_prog = Keypair::new().pubkey();
+    e.svm.add_program(lm_prog, limit_matcher_elf).expect("limit_matcher ELF load failed");
+    e.svm.add_program(adp_prog, adapter_elf).expect("oracle_adapter ELF load failed");
+
+    let pyth_prog_id = Address::from_str_const("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+    let pyth_fid = [0x99u8; 32];
+    let make_pyth_v2 = |price: i64, pub_ts: i64, posted_slot: u64| -> Vec<u8> {
+        let mut d = vec![0u8; 133];
+        d[0..8].copy_from_slice(&[34, 241, 35, 99, 157, 126, 244, 205]);
+        d[40] = 1; // VerificationLevel::Full
+        d[41..73].copy_from_slice(&pyth_fid);
+        d[73..81].copy_from_slice(&price.to_le_bytes());
+        d[81..89].copy_from_slice(&5_000_000u64.to_le_bytes());
+        d[89..93].copy_from_slice(&(-8i32).to_le_bytes());
+        d[93..101].copy_from_slice(&pub_ts.to_le_bytes());
+        d[125..133].copy_from_slice(&posted_slot.to_le_bytes());
+        d
+    };
+
+    let mut clk: Clock = e.svm.get_sysvar();
+    clk.slot = 10_000;
+    clk.unix_timestamp = 1_760_000_000;
+    e.svm.set_sysvar(&clk);
+    e.slot = 10_000;
+
+    // Create Pyth-backed BTC market (`maxStaleness = 9_000` [~1h], `im=1000, mm=600, liqFee=50, tradeFee=2, maxMove=100, maxFrontBps=2500`)
+    let adp_acc = create_prog_acc(&mut e.svm, &adp_prog, 352);
+    let (orac_pda, orac_bump) = Address::find_program_address(&[b"orac", adp_acc.as_ref()], &adp_prog);
+    let pyth_feed = Keypair::new().pubkey();
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000, clk.unix_timestamp, clk.slot), // $100.00
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    let admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    let mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let mut cm_ix = ix_create_market(
+        e.prog_id, e.dex, mkt, e.mint, orac_pda, e.admin.pubkey(), admin_tok, e.fee_vault,
+        100 * POS_SCALE, 10, 9_000, 0, 1000, 600, 50, 2, 100, 2500, 1_000_000 * POS_SCALE,
+    );
+    cm_ix.data[2..4].copy_from_slice(&2500u16.to_le_bytes()); // maxFrontBps = 2500 (25% async cross-backing!)
+    send_ok(&mut e.svm, cm_ix, &e.payer, &[&e.payer, &e.admin]);
+    e.markets.push(mkt);
+    let mid = read_u64(&e.svm, &mkt, 8);
+
+    // Init OracleAdapter (Pyth V2, maxAge = 30s, maxConf = 100 bps, feedId pinned)
+    let mut init_adp = vec![0u8; 60];
+    init_adp[0] = 0; init_adp[1] = orac_bump; init_adp[2] = 1; // FEED_PYTH_V2
+    init_adp[4..12].copy_from_slice(&30u64.to_le_bytes());
+    init_adp[12..20].copy_from_slice(&100u64.to_le_bytes());
+    init_adp[28..60].copy_from_slice(&pyth_fid);
+    send_ok(&mut e.svm, Instruction {
+        program_id: adp_prog,
+        accounts: vec![
+            AccountMeta::new(adp_acc, false),
+            AccountMeta::new_readonly(e.admin.pubkey(), true),
+            AccountMeta::new_readonly(e.prog_id, false),
+            AccountMeta::new_readonly(mkt, false),
+            AccountMeta::new_readonly(pyth_feed, false),
+        ],
+        data: init_adp,
+    }, &e.payer, &[&e.payer, &e.admin]);
+
+    let perc_prog = e.prog_id;
+    let ix_crank = || Instruction {
+        program_id: adp_prog,
+        accounts: vec![
+            AccountMeta::new_readonly(adp_acc, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new_readonly(pyth_feed, false),
+            AccountMeta::new_readonly(orac_pda, false),
+            AccountMeta::new_readonly(perc_prog, false),
+        ],
+        data: vec![1],
+    };
+
+    // Seed $100 insurance for async cross-backing fronting
+    let lp_kp = Keypair::new();
+    e.svm.airdrop(&lp_kp.pubkey(), 1_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_kp.pubkey(), 200 * POS_SCALE);
+    let r_lp = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, mkt, r_lp, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &e.payer, &[&e.payer, &lp_kp]);
+
+    // Open two pairs @ $100:
+    //   Pair 1 (alice Long 1.0 [$25 cap] vs bob Short 1.0 [$50 cap]): will voluntarily close at $82 via direct mode=4!
+    //   Pair 2 (carol Long 1.0 [$25 cap] vs dave Short 1.0 [$50 cap]): will close at $82 via LimitMatcher (mode=4)!
+    let alice = e.create_trader(100 * POS_SCALE, 25 * POS_SCALE);
+    let bob   = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    let carol = e.create_trader(100 * POS_SCALE, 25 * POS_SCALE);
+    let dave  = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    e.trade(mkt, &alice, &bob, 0, POS_SCALE);
+    e.trade(mkt, &carol, &dave, 0, POS_SCALE);
+
+    // =========================================================================
+    // OUTAGE 1: 12-HOUR SOLANA NETWORK HALT (`ts += 43_200`, `slot += 2`) + -20% SPOT CRASH ($100 -> $80)!
+    // =========================================================================
+    clk.slot += 2;
+    clk.unix_timestamp += 43_200; // 12 hours later!
+    e.svm.set_sysvar(&clk);
+    e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(8_000_000_000, clk.unix_timestamp - 1, clk.slot), // real spot = $80.00!
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+
+    // 1a. StartWindDown MUST FAIL (Solana Clock.slot froze across the 12-hour halt -> NOT stale!)
+    send_err(&mut e.svm, ix_start_wind_down(e.prog_id, mkt, bob.kp.pubkey()), &e.payer, &[&e.payer, &bob.kp],
+        "12h Solana halt must NOT falsely trigger permissionless StartWindDown!");
+
+    // 1b. OracleAdapter cranks paced step 1 ($100 -> $99.00, saturated!) -> stamps `MktOff.lastRampSlot = curSlot`!
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &mkt, 112), 99 * POS_SCALE, "Loaded market steps smoothly $100 -> $99 on restart slot 1!");
+    assert_eq!(read_u64(&e.svm, &mkt, 152), clk.slot, "Saturated ramp step stamped MktOff.lastRampSlot!");
+
+    // 1c. Fronting PAUSED during saturated catch-up ramp: Bob refreshes Short (+$1 gain), I_m MUST NOT front!
+    let ins_pre_ramp = read_u64(&e.svm, &mkt, 224);
+    e.refresh(mkt, &bob);
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 0, "I_m fronting MUST be paused during outage catch-up ramp!");
+    assert_eq!(read_u64(&e.svm, &mkt, 224), ins_pre_ramp, "I_m cash bit-for-bit untouched during ramp!");
+
+    // =========================================================================
+    // OUTAGE 2: VOLUNTARY REAL-PRICE EXIT ON SLOT 1 OF RESTART (NO TRADE BLOCKING!)
+    // =========================================================================
+    // 2a. Margin-stripping guards: mode=0 open & mode=2 hand-off at $82 (-17% from mark $99) MUST FAIL Custom(130)!
+    let shell = e.create_trader(100 * POS_SCALE, 50 * POS_SCALE);
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, mkt, shell.pfl, shell.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 0, POS_SCALE / 10, 82 * POS_SCALE),
+        &e.payer, &[&e.payer, &shell.kp, &bob.kp], 130,
+        "mode=0 open at wide $82 spread MUST stay clamped (blocks margin-stripping!)",
+    );
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, mkt, alice.pfl, alice.kp.pubkey(), shell.pfl, shell.kp.pubkey(), 2, POS_SCALE / 10, 82 * POS_SCALE),
+        &e.payer, &[&e.payer, &alice.kp, &shell.kp], 130,
+        "mode=2 hand-off at wide $82 spread MUST stay clamped (blocks margin-stripping!)",
+    );
+
+    // 2b. Voluntary bilateral close at real spot $82 via `mode = 4` (auto-routed to unclamped `mode = 1`!):
+    //     Bob buys 1.0 from Alice at $82 while mark is still $99 (-17% spread = $17 paid by Alice to Bob)!
+    let alice_pre = e.capital(&alice);
+    let bob_pre   = e.capital(&bob);
+    send_ok(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, mkt, bob.pfl, bob.kp.pubkey(), alice.pfl, alice.kp.pubkey(), 4, POS_SCALE, 82 * POS_SCALE),
+        &e.payer, &[&e.payer, &bob.kp, &alice.kp],
+    );
+    assert_eq!(find_leg(&e, alice.pfl, mkt), (0, 0), "Alice voluntarily exited Long 1.0 at real price $82 on slot 1!");
+    assert_eq!(find_leg(&e, bob.pfl, mkt),   (0, 0), "Bob voluntarily exited Short 1.0 at real price $82 on slot 1!");
+    // Alice lost $1 mark ($100->$99) + paid $17 spread = -$18 total; Bob gained +$1 mark (via R_m) + $17 spread = +$18!
+    assert_eq!(alice_pre - e.capital(&alice), 18 * POS_SCALE, "Alice settled exact -$18 ($100 -> $82) with 0 liq fee!");
+    assert_eq!(e.capital(&bob) - bob_pre,     18 * POS_SCALE, "Bob received exact +$18 ($100 -> $82) with 0 ADL!");
+    assert_eq!(read_u64(&e.svm, &mkt, 224), ins_pre_ramp, "I_m untouched on voluntary wide close!");
+
+    // 2c. Limit-guarded `TradeWithMatcher(mode = 4)` via `LimitMatcher`:
+    //     Dave posts a Limit Buy @ $82 (closing his Short 1.0); Carol sells her Long 1.0 into it:
+    //     - With `limitPrice = 0`: REJECTED `Custom(130)` (safety backstop when taker sets no limitPrice!)
+    //     - With `limitPrice = $80`: SUCCEEDS at exact `$82.00`, taking market `OI -> 0`!
+    let dave_ctx = create_prog_acc(&mut e.svm, &lm_prog, 864);
+    send_ok(&mut e.svm, Instruction {
+        program_id: lm_prog,
+        accounts: vec![
+            AccountMeta::new(dave_ctx, false),
+            AccountMeta::new_readonly(dave.kp.pubkey(), true),
+            AccountMeta::new_readonly(e.prog_id, false),
+        ],
+        data: vec![0u8],
+    }, &e.payer, &[&e.payer, &dave.kp]);
+    send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, dave.pfl, dave.kp.pubkey(), Some(dave_ctx)), &e.payer, &[&e.payer, &dave.kp]);
+    // Place Limit Buy order (slot 0, ORD_LIMIT=0, isBuy=1, flags=0, oco=0xFF, mid, limitPrice=$82, trig=0, qty=1.0, exp=0, paramA=0)
+    let mut place_d = Vec::with_capacity(54);
+    place_d.extend_from_slice(&[1u8, 0, 0, 1, 0, 0xFF]);
+    place_d.extend_from_slice(&mid.to_le_bytes());
+    place_d.extend_from_slice(&(82 * POS_SCALE).to_le_bytes());
+    place_d.extend_from_slice(&0u64.to_le_bytes());
+    place_d.extend_from_slice(&POS_SCALE.to_le_bytes());
+    place_d.extend_from_slice(&0u64.to_le_bytes());
+    place_d.extend_from_slice(&0u64.to_le_bytes());
+    send_ok(&mut e.svm, Instruction {
+        program_id: lm_prog,
+        accounts: vec![AccountMeta::new(dave_ctx, false), AccountMeta::new_readonly(dave.kp.pubkey(), true)],
+        data: place_d,
+    }, &e.payer, &[&e.payer, &dave.kp]);
+    let sysvar_ix_id = Address::from_str_const("Sysvar1nstructions1111111111111111111111111");
+    // Unprotected market order (`limitPrice = 0`) MUST refuse off-mark fill (LimitMatcher returns Custom(301))!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, mkt, carol.pfl, carol.kp.pubkey(), dave.pfl, lm_prog, dave_ctx, Some(sysvar_ix_id), 4, false, POS_SCALE, 0),
+        &e.payer, &[&e.payer, &carol.kp], 301,
+        "TradeWithMatcher(limitPrice=0) MUST refuse wide off-mark close!",
+    );
+    // Explicit limit-guarded close (`limitPrice = $80`) SUCCEEDS at exact $82.00!
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, mkt, carol.pfl, carol.kp.pubkey(), dave.pfl, lm_prog, dave_ctx, Some(sysvar_ix_id), 4, false, POS_SCALE, 80 * POS_SCALE),
+        &e.payer, &[&e.payer, &carol.kp],
+    );
+    assert_eq!(read_u64(&e.svm, &mkt, 256), 0, "Market OI dropped cleanly to 0 via voluntary real-price exits!");
+    assert_eq!(read_u64(&e.svm, &mkt, 264), 0);
+    e.check("t25-after-voluntary-reprice-exits");
+
+    // =========================================================================
+    // OUTAGE 3: INSTANT 1-SLOT ORACLE SNAP WHEN `OI == 0` + ASYNC CROSS-BACKING RESUMES!
+    // =========================================================================
+    clk.slot += 1;
+    clk.unix_timestamp += 1;
+    e.svm.set_sysvar(&clk);
+    e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(8_000_000_000, clk.unix_timestamp, clk.slot), // $80.00
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &mkt, 112), 80 * POS_SCALE, "Empty market snapped $99 -> $80 in ONE SINGLE SLOT!");
+    assert_eq!(read_u64(&e.svm, &mkt, 152), 0, "Instant snap cleared MktOff.lastRampSlot to 0!");
+
+    // Verify normal async I_m cross-backing fronting IMMEDIATELY works again on a calm +0.4% tick ($80 -> $80.32)!
+    e.trade(mkt, &bob, &shell, 0, 5 * POS_SCALE);
+    clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(8_032_000_000, clk.unix_timestamp, clk.slot), // +0.4% < 75% of 1% -> calm tick!
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &mkt, 152), 0, "Calm +0.4% tick keeps lastRampSlot == 0!");
+    e.refresh(mkt, &bob); // Bob refreshes BEFORE Shell -> I_m fronts exact $1.60 immediately!
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 1_600_000, "Async I_m cross-backing fronting immediately active ($1.60 fronted)!");
+    e.refresh(mkt, &shell); // Shell repays $1.60 senior -> insFronted == 0!
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 0, "Shell repaid $1.60 senior -> insFronted == 0!");
+    e.trade(mkt, &bob, &shell, 1, 5 * POS_SCALE);
+
+    // =========================================================================
+    // OUTAGE 4: 30-MINUTE ORACLE/KEEPER OUTAGE (+4,500 SLOTS) + CATASTROPHIC CRASH + #113 10-PAIR SELF-TRADE = $0 I_m LOSS!
+    // =========================================================================
+    let mut atk_pairs: Vec<(Trader, Trader)> = Vec::new();
+    for _ in 0..10 {
+        let l = e.create_trader(50 * POS_SCALE, 8_100_000); // ~10% IM @ $80.32 + fee
+        let s = e.create_trader(50 * POS_SCALE, 20 * POS_SCALE);
+        e.trade(mkt, &l, &s, 0, POS_SCALE);
+        atk_pairs.push((l, s));
+    }
+    let ins_before_30m = read_u64(&e.svm, &mkt, 224);
+
+    // 30-minute keeper/oracle outage (+4,500 slots < maxStaleness 9,000) while spot drops -12.5% ($80 -> $70)!
+    clk.slot += 4_500;
+    clk.unix_timestamp += 1_800;
+    e.svm.set_sysvar(&clk);
+    e.slot = clk.slot;
+    send_err(&mut e.svm, ix_start_wind_down(e.prog_id, mkt, bob.kp.pubkey()), &e.payer, &[&e.payer, &bob.kp],
+        "30-min outage (4500 < maxStaleness 9000) keeps market Active!");
+
+    // Oracle ramps all the way down from $80 -> $70 with ZERO liquidations; attacker tries fronting mid-ramp!
+    for _ in 0..30 {
+        if read_u64(&e.svm, &mkt, 112) <= 70 * POS_SCALE { break; }
+        clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        e.svm.set_account(pyth_feed, Account {
+            lamports: 10_000_000,
+            data: make_pyth_v2(7_000_000_000, clk.unix_timestamp, clk.slot), // $70.00
+            owner: pyth_prog_id, executable: false, rent_epoch: 0,
+        }).unwrap();
+        send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+        // Attacker repeatedly tries to front from I_m during the ramp -> MUST front 0!
+        e.refresh(mkt, &atk_pairs[0].1);
+        assert_eq!(read_u64(&e.svm, &mkt, 232), 0, "Fronting stayed 0 throughout entire 30-min outage catch-up ramp!");
+    }
+    assert_eq!(read_u64(&e.svm, &mkt, 112), 70 * POS_SCALE, "Market smoothly ramped to $70.00 after 30-min outage!");
+
+    // Liquidate all 10 bankrupt attacker Longs: Pure ADL -> I_m loses EXACT $0!
+    let keep_kp = Keypair::new();
+    let keep_tok = create_tok_acc(&mut e.svm, &e.mint, &keep_kp.pubkey(), 0);
+    for (l, _) in &atk_pairs {
+        send_ok(&mut e.svm, ix_liquidate(e.prog_id, e.dex, mkt, l.pfl, keep_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID), &e.payer, &[&e.payer]);
+    }
+    assert_eq!(read_u64(&e.svm, &mkt, 224), ins_before_30m, "30-min outage + 10-pair #113 bankruptcy drained EXACT $0 from I_m!");
+    assert_eq!(read_u64(&e.svm, &mkt, 232), 0, "insFronted == 0!");
+    e.check("t25-final-all-outage-scenarios");
+    println!("       [t25] Network Outage Suite PASSED: 12h halt + slot-1 $82 wide close (mode=4 & LimitMatcher) + 1-slot OI=0 snap + 30m outage #113 = $0 I_m loss!");
+}
+
+/// Test 26: Full Hyperliquid / Binance Product-UX Scenario Matrix (Cross-Margin × Outages × Liquidations × HLP × Post-ADL × WindDown)!
+///   Positive user-experience verification across ALL 7 weird real-world scenarios:
+///     Cell 1: Cross-Margin Hedged Spread (`Long BTC + Short ETH`, 10x gross) survives 12h halt + -20% correlated crash -> EXACT $100 equity, 0 liq!
+///     Cell 2: Partial Outage (BTC live -15%, ETH oracle paused 30m -> then >1h dead):
+///             BTC liquidates cleanly with ETH.lockedMm bit-for-bit untouched; dead ETH blocks new opens (Custom 105)
+///             YET still allows voluntary `mode=1`/`mode=4` real-price exit ($92) without killing the market, and never blocks BTC!
+///     Cell 3: Voluntary De-Risking (`mode=4` partial close 8/10 BTC at real spot $82 on slot 1 of restart) saves cross-margin account
+///             holding `BTC + ETH` through the full `$99 -> $82` ramp with 0 liquidation & 0 keeper fee!
+///     Cell 4: Zero-ADL `HlpVault` liquidation takeover during a -15% outage ramp (0 bad debt, `ADL_ONE` preserved, HLP earns fee)!
+///     Cell 5: Catastrophic zero-keeper outage -> Pure-ADL ($0 I_m draw) -> surviving Short is NOT stuck (closes, new traders open, ADL resets to 1.0)!
+///     Cell 6: Permanently dead oracle (`> maxStaleness`) -> permissionless WindDown -> voluntary close -> ForceClose -> Resolve -> ClaimResolved (100% funds back, live BTC unaffected)!
+///     Cell 7: Async Cross-Backing (`I_m` fronting) full lifecycle: Normal instant 1:1 fronting -> Ramp auto-pause ($0 LP loss) -> Post-ramp auto-resume!
+pub fn test_26_hl_binance_product_ux_outage_matrix(
+    elf: &[u8],
+    matcher_elf: &[u8],
+    adapter_elf: &[u8],
+    hlp_elf: &[u8],
+) {
+    let mut e = BoringEnv::new(elf);
+    let m_prog   = Keypair::new().pubkey();
+    let adp_prog = Keypair::new().pubkey();
+    let hlp_prog = Keypair::new().pubkey();
+    e.svm.add_program(m_prog, matcher_elf).expect("matcher ELF load failed");
+    e.svm.add_program(adp_prog, adapter_elf).expect("oracle_adapter ELF load failed");
+    e.svm.add_program(hlp_prog, hlp_elf).expect("hlp_vault ELF load failed");
+
+    let pyth_prog_id = Address::from_str_const("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+    let make_pyth_v2 = |fid: [u8; 32], price: i64, pub_ts: i64, posted_slot: u64| -> Vec<u8> {
+        let mut d = vec![0u8; 133];
+        d[0..8].copy_from_slice(&[34, 241, 35, 99, 157, 126, 244, 205]);
+        d[40] = 1;
+        d[41..73].copy_from_slice(&fid);
+        d[73..81].copy_from_slice(&price.to_le_bytes());
+        d[81..89].copy_from_slice(&5_000_000u64.to_le_bytes());
+        d[89..93].copy_from_slice(&(-8i32).to_le_bytes());
+        d[93..101].copy_from_slice(&pub_ts.to_le_bytes());
+        d[125..133].copy_from_slice(&posted_slot.to_le_bytes());
+        d
+    };
+
+    let mut clk: Clock = e.svm.get_sysvar();
+    clk.slot = 20_000;
+    clk.unix_timestamp = 1_770_000_000;
+    e.svm.set_sysvar(&clk);
+    e.slot = clk.slot;
+
+    let admin_tok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    let keep_kp = Keypair::new();
+    let keep_tok = create_tok_acc(&mut e.svm, &e.mint, &keep_kp.pubkey(), 0);
+
+    // Helper: create a Pyth-backed market with `maxStaleness = 9_000`, `im=1000, mm=600, liqFee=50, tradeFee=0, maxMove=100, maxFront=2500`
+    let mk_pyth_market = |e: &mut BoringEnv, fid: [u8; 32], ts: i64, sl: u64| -> (Address, Address, Address, Address) {
+        let adp = create_prog_acc(&mut e.svm, &adp_prog, 352);
+        let (pda, bump) = Address::find_program_address(&[b"orac", adp.as_ref()], &adp_prog);
+        let feed = Keypair::new().pubkey();
+        e.svm.set_account(feed, Account {
+            lamports: 10_000_000, data: make_pyth_v2(fid, 10_000_000_000, ts, sl),
+            owner: pyth_prog_id, executable: false, rent_epoch: 0,
+        }).unwrap();
+        let mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+        let mut cm = ix_create_market(
+            e.prog_id, e.dex, mkt, e.mint, pda, e.admin.pubkey(), admin_tok, e.fee_vault,
+            100 * POS_SCALE, 10, 9_000, 0, 1000, 600, 50, 0, 100, 2500, 1_000_000 * POS_SCALE,
+        );
+        cm.data[2..4].copy_from_slice(&2500u16.to_le_bytes());
+        send_ok(&mut e.svm, cm, &e.payer, &[&e.payer, &e.admin]);
+        e.markets.push(mkt);
+        let mut ia = vec![0u8; 60];
+        ia[0] = 0; ia[1] = bump; ia[2] = 1;
+        ia[4..12].copy_from_slice(&30u64.to_le_bytes());
+        ia[12..20].copy_from_slice(&100u64.to_le_bytes());
+        ia[28..60].copy_from_slice(&fid);
+        send_ok(&mut e.svm, Instruction {
+            program_id: adp_prog,
+            accounts: vec![
+                AccountMeta::new(adp, false), AccountMeta::new_readonly(e.admin.pubkey(), true),
+                AccountMeta::new_readonly(e.prog_id, false), AccountMeta::new_readonly(mkt, false),
+                AccountMeta::new_readonly(feed, false),
+            ],
+            data: ia,
+        }, &e.payer, &[&e.payer, &e.admin]);
+        (mkt, adp, feed, pda)
+    };
+    let crank_pyth = |e: &mut BoringEnv, mkt: Address, adp: Address, feed: Address, pda: Address, fid: [u8; 32], price_e8: i64, ts: i64, sl: u64| {
+        e.svm.set_account(feed, Account {
+            lamports: 10_000_000, data: make_pyth_v2(fid, price_e8, ts, sl),
+            owner: pyth_prog_id, executable: false, rent_epoch: 0,
+        }).unwrap();
+        send_ok(&mut e.svm, Instruction {
+            program_id: adp_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(adp, false), AccountMeta::new(mkt, false),
+                AccountMeta::new_readonly(feed, false), AccountMeta::new_readonly(pda, false),
+                AccountMeta::new_readonly(e.prog_id, false),
+            ],
+            data: vec![1],
+        }, &e.payer, &[&e.payer]);
+    };
+
+    let fid_btc = [0xB1u8; 32];
+    let fid_eth = [0xE1u8; 32];
+    let (btc, btc_adp, btc_feed, btc_pda) = mk_pyth_market(&mut e, fid_btc, clk.unix_timestamp, clk.slot);
+    let (eth, eth_adp, eth_feed, eth_pda) = mk_pyth_market(&mut e, fid_eth, clk.unix_timestamp, clk.slot);
+
+    // Seed $200 insurance on BTC & ETH for async cross-backing fronting
+    let lp_kp = Keypair::new();
+    e.svm.airdrop(&lp_kp.pubkey(), 1_000_000_000).unwrap();
+    let lp_tok = create_tok_acc(&mut e.svm, &e.mint, &lp_kp.pubkey(), 500 * POS_SCALE);
+    let r_btc = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    let r_eth = create_prog_acc(&mut e.svm, &e.prog_id, INS_SIZE);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, btc, r_btc, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &e.payer, &[&e.payer, &lp_kp]);
+    send_ok(&mut e.svm, ix_deposit_insurance(e.prog_id, e.dex, eth, r_eth, lp_kp.pubkey(), lp_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, 200 * POS_SCALE), &e.payer, &[&e.payer, &lp_kp]);
+
+    let mm = e.create_trader(50_000 * POS_SCALE, 20_000 * POS_SCALE);
+
+    // =========================================================================
+    // CELL 1: Cross-Margin Hedged Spread (Long 5 BTC + Short 5 ETH, 10x gross on $100)
+    //         Survives 12-Hour Solana Halt + -20% Correlated Crash ($100 -> $80) -> EXACT $100 Equity, 0 Liq!
+    // =========================================================================
+    let hedger = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    e.trade(btc, &hedger, &mm, 0, 5 * POS_SCALE); // Long 5 BTC ($500, IM=$50)
+    e.trade(eth, &mm, &hedger, 0, 5 * POS_SCALE); // Short 5 ETH ($500, IM=$50)
+
+    // 12-hour Solana halt (`ts += 43_200`, `slot += 2`) with BOTH BTC & ETH crashing -20% ($100 -> $80)!
+    clk.unix_timestamp += 43_200;
+    for step in 0..45 {
+        if read_u64(&e.svm, &btc, 112) <= 80 * POS_SCALE && read_u64(&e.svm, &eth, 112) <= 80 * POS_SCALE { break; }
+        clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_000_000_000, clk.unix_timestamp, clk.slot);
+        crank_pyth(&mut e, eth, eth_adp, eth_feed, eth_pda, fid_eth, 8_000_000_000, clk.unix_timestamp, clk.slot);
+        // Every 3 steps (~3% move), MM settles losing ETH Long (funding R_ETH) and hedger refreshes [ETH, BTC]!
+        if step % 3 == 2 || read_u64(&e.svm, &btc, 112) <= 80 * POS_SCALE {
+            e.refresh(eth, &mm);
+            send_ixs_ok(&mut e.svm, &[
+                ix_refresh_leg(e.prog_id, e.dex, eth, hedger.pfl, false),
+                ix_refresh_leg(e.prog_id, e.dex, btc, hedger.pfl, false),
+            ], &e.payer, &[&e.payer]);
+        }
+    }
+    assert_eq!(read_u64(&e.svm, &btc, 112), 80 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &eth, 112), 80 * POS_SCALE);
+    assert_eq!(e.capital(&hedger), 100 * POS_SCALE, "Cell 1 (HL/Binance UX): Hedged cross-margin spread survived 12h halt + -20% crash with EXACT $100 equity!");
+    // Close hedger cleanly -> OI == 0 -> instant 1-slot snap back to $100!
+    e.refresh(btc, &mm); e.refresh(eth, &mm);
+    e.trade(btc, &hedger, &mm, 1, 5 * POS_SCALE);
+    e.trade(eth, &mm, &hedger, 1, 5 * POS_SCALE);
+    clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_000_000_000, clk.unix_timestamp, clk.slot);
+    crank_pyth(&mut e, eth, eth_adp, eth_feed, eth_pda, fid_eth, 10_000_000_000, clk.unix_timestamp, clk.slot);
+    assert_eq!(read_u64(&e.svm, &btc, 112), 100 * POS_SCALE, "Empty BTC snapped $80 -> $100 in 1 slot!");
+    assert_eq!(read_u64(&e.svm, &eth, 112), 100 * POS_SCALE, "Empty ETH snapped $80 -> $100 in 1 slot!");
+
+    // =========================================================================
+    // CELL 2: Partial Outage (BTC live -15%, ETH oracle paused 30m -> then >1h dead!)
+    //   - BTC liquidates cleanly while ETH.lockedMm stays bit-for-bit untouched!
+    //   - Once ETH stalls > maxStaleness (9,000 slots): new opens REJECTED (Custom 105),
+    //     YET voluntary `mode=4` / `mode=1` close at real price $92 SUCCEEDS without killing ETH!
+    // =========================================================================
+    let p_user = e.create_trader(500 * POS_SCALE, 150 * POS_SCALE);
+    e.trade(btc, &p_user, &mm, 0, 10 * POS_SCALE); // Long 10 BTC ($1,000, MM=$60)
+    e.trade(eth, &mm, &p_user, 0, 5 * POS_SCALE);  // Short 5 ETH ($500, MM=$30)
+    let eth_mid = read_u64(&e.svm, &eth, 8);
+    assert_eq!(leg_locked_mm_for_mkt(&e.svm, &p_user.pfl, eth_mid), 30 * POS_SCALE);
+
+    // ETH oracle stops for 30 minutes (+4,500 slots), while BTC crashes -15% ($100 -> $85)!
+    clk.slot += 4_500; clk.unix_timestamp += 1_800; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    for _ in 0..17 {
+        if read_u64(&e.svm, &btc, 112) <= 85 * POS_SCALE { break; }
+        clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_500_000_000, clk.unix_timestamp, clk.slot);
+    }
+    // Keeper atomically runs [RefreshLeg(ETH), Liquidate(BTC)]: BTC liquidates cleanly, ETH 100% untouched!
+    send_ixs_ok(&mut e.svm, &[
+        ix_refresh_leg(e.prog_id, e.dex, eth, p_user.pfl, false),
+        ix_liquidate(e.prog_id, e.dex, btc, p_user.pfl, keep_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+    ], &e.payer, &[&e.payer]);
+    assert_eq!(find_leg(&e, p_user.pfl, btc), (0, 0), "Cell 2: Underwater BTC liquidated cleanly during ETH outage!");
+    assert_eq!(find_leg(&e, p_user.pfl, eth), (2, 5 * POS_SCALE), "Cell 2: ETH Short stayed 100% open & intact!");
+    assert_eq!(leg_locked_mm_for_mkt(&e.svm, &p_user.pfl, eth_mid), 30 * POS_SCALE, "Cell 2: ETH.lockedMm == $30 bit-for-bit untouched!");
+
+    // Now ETH stalls past maxStaleness (+5,000 more slots -> total age 9,500 > 9,000, NO WindDown called!):
+    clk.slot += 5_000; clk.unix_timestamp += 2_000; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    // New open on stale ETH MUST fail (Custom 106 `PErr.oracleStale`):
+    send_err_custom(&mut e.svm, ix_trade(e.prog_id, e.dex, eth, mm.pfl, mm.kp.pubkey(), p_user.pfl, p_user.kp.pubkey(), 0, POS_SCALE),
+        &e.payer, &[&e.payer, &mm.kp, &p_user.kp], 106, "Cell 2: mode=0 open on stale ETH rejected (106)");
+    // Clean up MM's dead BTC leg first so MM has no stale second leg when paying spread on ETH!
+    send_ok(&mut e.svm, ix_clear_dead_leg(e.prog_id, e.dex, btc, mm.pfl), &e.payer, &[&e.payer]);
+    send_ok(&mut e.svm, ix_refresh_leg_signed(e.prog_id, e.dex, btc, mm.pfl, mm.kp.pubkey(), true), &e.payer, &[&e.payer, &mm.kp]);
+    // YET voluntary `mode=4` (auto-routed to `mode=1`) close at real spot $92 SUCCEEDS (users NEVER trapped!)
+    send_ok(&mut e.svm, ix_trade_ext(e.prog_id, e.dex, eth, p_user.pfl, p_user.kp.pubkey(), mm.pfl, mm.kp.pubkey(), 4, 5 * POS_SCALE, 92 * POS_SCALE),
+        &e.payer, &[&e.payer, &p_user.kp, &mm.kp]);
+    assert_eq!(find_leg(&e, p_user.pfl, eth), (0, 0), "Cell 2 (HL/Binance UX): Voluntary real-price exit on stale ETH succeeded without WindDown!");
+    // Instant snap both empty BTC & ETH back to $100!
+    clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_000_000_000, clk.unix_timestamp, clk.slot);
+    crank_pyth(&mut e, eth, eth_adp, eth_feed, eth_pda, fid_eth, 10_000_000_000, clk.unix_timestamp, clk.slot);
+
+    // =========================================================================
+    // CELL 3: Voluntary Partial De-Risking (`mode=4` at real spot $82 on slot 1)
+    //         Saves Cross-Margin Portfolio (`10 BTC + 5 ETH`) Through Full Ramp With 0 Liq!
+    // =========================================================================
+    let saver = e.create_trader(500 * POS_SCALE, 250 * POS_SCALE);
+    e.trade(btc, &saver, &mm, 0, 10 * POS_SCALE); // Long 10 BTC ($1,000)
+    e.trade(eth, &saver, &mm, 0, 5 * POS_SCALE);  // Long 5 ETH ($500)
+    // 12h halt, BTC drops to $82 while ETH stays $100:
+    clk.slot += 2; clk.unix_timestamp += 43_200; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_200_000_000, clk.unix_timestamp, clk.slot); // mark=$99
+    crank_pyth(&mut e, eth, eth_adp, eth_feed, eth_pda, fid_eth, 10_000_000_000, clk.unix_timestamp, clk.slot);
+    // Slot 1 of restart: saver voluntarily cuts 8 of 10 BTC at real spot $82 via `mode=4` (auto `mode=1`)!
+    e.refresh(eth, &saver); e.refresh(eth, &mm);
+    send_ok(&mut e.svm, ix_trade_ext(e.prog_id, e.dex, btc, mm.pfl, mm.kp.pubkey(), saver.pfl, saver.kp.pubkey(), 4, 8 * POS_SCALE, 82 * POS_SCALE),
+        &e.payer, &[&e.payer, &mm.kp, &saver.kp]);
+    assert_eq!(find_leg(&e, saver.pfl, btc), (1, 2 * POS_SCALE), "Cell 3: Saver cut 8/10 BTC at $82 on slot 1!");
+    // Ride the ENTIRE BTC ramp $99 -> $82: remaining 2 BTC + 5 ETH stays 100% healthy (cannot be liquidated!)
+    for _ in 0..22 {
+        if read_u64(&e.svm, &btc, 112) <= 82 * POS_SCALE { break; }
+        clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_200_000_000, clk.unix_timestamp, clk.slot);
+    }
+    e.refresh(eth, &saver);
+    send_err(&mut e.svm, ix_liquidate(e.prog_id, e.dex, btc, saver.pfl, keep_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID),
+        &e.payer, &[&e.payer], "Cell 3 (HL/Binance UX): Voluntarily de-risked portfolio MUST stay healthy (0 liquidation!)");
+    // Close saver cleanly -> snap BTC back to $100!
+    e.refresh(btc, &mm); e.refresh(eth, &mm);
+    e.trade(btc, &saver, &mm, 1, 2 * POS_SCALE);
+    e.trade(eth, &saver, &mm, 1, 5 * POS_SCALE);
+    clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_000_000_000, clk.unix_timestamp, clk.slot);
+
+    // =========================================================================
+    // CELL 4: Zero-ADL `HlpVault` Liquidation Takeover During a -15% Outage Ramp!
+    // =========================================================================
+    let btc_mid = read_u64(&e.svm, &btc, 8);
+    let hlp_strat = Keypair::new();
+    let hlp_lp    = Keypair::new();
+    e.svm.airdrop(&hlp_strat.pubkey(), 1_000_000_000).unwrap();
+    e.svm.airdrop(&hlp_lp.pubkey(), 1_000_000_000).unwrap();
+    let hlp_vault = create_prog_acc(&mut e.svm, &hlp_prog, HLP_SIZE);
+    let (hlp_pda, hlp_bump) = Address::find_program_address(&[b"hlpv", hlp_vault.as_ref()], &hlp_prog);
+    let hlp_pfl = create_prog_acc(&mut e.svm, &e.prog_id, PFL_SIZE);
+    e.portfolios.push(hlp_pfl);
+    let hlp_fee_tok = create_tok_acc(&mut e.svm, &e.mint, &hlp_pda, 0);
+    let hlp_lp_tok = create_tok_acc(&mut e.svm, &e.mint, &hlp_lp.pubkey(), 1_000 * POS_SCALE);
+    let hlp_rec = create_prog_acc(&mut e.svm, &hlp_prog, HLP_REC_SIZE);
+    send_ok(&mut e.svm, ix_init_hlp_vault(hlp_prog, hlp_vault, hlp_strat.pubkey(), e.dex, hlp_pfl, hlp_pda, hlp_fee_tok, e.prog_id, m_prog, hlp_bump, 0, 0, POS_SCALE, &[btc_mid]),
+        &e.payer, &[&e.payer, &hlp_strat]);
+    send_ok(&mut e.svm, ix_deposit_hlp(hlp_prog, hlp_vault, hlp_rec, hlp_lp.pubkey(), hlp_lp_tok, e.dex, hlp_pfl, e.mint, e.dex_vault, TOKEN_PROGRAM_ID, e.prog_id, 500 * POS_SCALE),
+        &e.payer, &[&e.payer, &hlp_lp]);
+
+    let deg10x = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    let whale3x = e.create_trader(500 * POS_SCALE, 350 * POS_SCALE);
+    e.trade(btc, &deg10x,  &mm, 0, 10 * POS_SCALE); // 10x Long ($1,000)
+    e.trade(btc, &whale3x, &mm, 0, 10 * POS_SCALE); // ~3x Long ($1,000)
+
+    // Outage ramp down toward $85: as mark crosses ~$95.10, HlpVault takes over deg10x with ZERO ADL!
+    let mut took_over = false;
+    for _ in 0..20 {
+        if read_u64(&e.svm, &btc, 112) <= 85 * POS_SCALE { break; }
+        clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_500_000_000, clk.unix_timestamp, clk.slot);
+        if !took_over && read_u64(&e.svm, &btc, 112) <= 95_500_000 {
+            send_ok(&mut e.svm, ix_hlp_takeover_liquidate(
+                hlp_prog, hlp_vault, hlp_strat.pubkey(), e.dex, btc, deg10x.pfl, hlp_fee_tok,
+                e.mint, e.dex_vault, TOKEN_PROGRAM_ID, hlp_pfl, hlp_pda, e.prog_id, 0,
+            ), &e.payer, &[&e.payer, &hlp_strat]);
+            took_over = true;
+            // HLP immediately hedges/closes its taken-over 10 BTC against MM via PropAMM or direct? Bind 0-spread PropAMM or leave closed after test!
+            let hlp_prop = create_prog_acc(&mut e.svm, &m_prog, PROP_AMM_SIZE);
+            send_ok(&mut e.svm, ix_init_prop_amm(m_prog, hlp_prop, hlp_strat.pubkey(), 0, 0, 0, 20 * POS_SCALE, &[btc_mid]), &e.payer, &[&e.payer, &hlp_strat]);
+            send_ok(&mut e.svm, ix_set_hlp_matcher(hlp_prog, hlp_vault, hlp_strat.pubkey(), hlp_pfl, hlp_pda, e.prog_id, Some(hlp_prop), None), &e.payer, &[&e.payer, &hlp_strat]);
+            send_ok(&mut e.svm, ix_trade_with_matcher(e.prog_id, e.dex, btc, mm.pfl, mm.kp.pubkey(), hlp_pfl, m_prog, hlp_prop, None, 1, false, 10 * POS_SCALE, 97 * POS_SCALE), &e.payer, &[&e.payer, &mm.kp]);
+        }
+    }
+    assert!(took_over, "Cell 4: HlpVault took over 10x Long mid-ramp!");
+    assert_eq!(read_u64(&e.svm, &btc, 288), ADL_ONE, "Cell 4 (HL UX): ZERO ADL on longs during ramp takeover!");
+    assert_eq!(read_u64(&e.svm, &btc, 296), ADL_ONE, "Cell 4 (HL UX): ZERO ADL on shorts during ramp takeover!");
+    assert_eq!(find_leg(&e, whale3x.pfl, btc), (1, 10 * POS_SCALE), "Cell 4: Honest 3x whale rode entire -15% ramp untouched!");
+    e.refresh(btc, &whale3x); e.refresh(btc, &mm);
+    e.trade(btc, &whale3x, &mm, 1, 10 * POS_SCALE);
+    clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_000_000_000, clk.unix_timestamp, clk.slot);
+
+    // =========================================================================
+    // CELL 5: Catastrophic Zero-Keeper Outage -> Pure-ADL ($0 I_m Loss) -> Full Post-ADL Recovery!
+    // =========================================================================
+    let bk_l = e.create_trader(200 * POS_SCALE, 40 * POS_SCALE); // Long 4 BTC (10x)
+    let ok_l = e.create_trader(500 * POS_SCALE, 300 * POS_SCALE); // Long 6 BTC (2x, healthy!)
+    let bob_s = e.create_trader(1_000 * POS_SCALE, 500 * POS_SCALE); // Short 10 BTC
+    e.trade(btc, &bk_l, &bob_s, 0, 4 * POS_SCALE);
+    e.trade(btc, &ok_l, &bob_s, 0, 6 * POS_SCALE);
+    let ins_pre_adl = read_u64(&e.svm, &btc, 224);
+
+    // Zero-keeper crash -12% ($100 -> $88): bk_l goes bankrupt ($40 cap vs $48 loss) -> Pure-ADL!
+    for _ in 0..15 {
+        if read_u64(&e.svm, &btc, 112) <= 88 * POS_SCALE { break; }
+        clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+        crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_800_000_000, clk.unix_timestamp, clk.slot);
+    }
+    send_ok(&mut e.svm, ix_liquidate(e.prog_id, e.dex, btc, bk_l.pfl, keep_tok, e.mint, e.dex_vault, TOKEN_PROGRAM_ID), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &btc, 224), ins_pre_adl, "Cell 5: Pure ADL drew EXACT $0 from I_BTC!");
+    assert!(read_u64(&e.svm, &btc, 296) < ADL_ONE, "Cell 5: Partial ADL reduced adlShort (10 -> 6 effective BTC)!");
+
+    // Post-ADL HL/Binance UX:
+    //   1. New traders (fresh_l, fresh_s) can STILL open fresh positions on the partially-ADL'd market!
+    let fresh_l = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    let fresh_s = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    e.trade(btc, &fresh_l, &fresh_s, 0, 2 * POS_SCALE);
+    //   2. Surviving partially-ADL'd Short `bob_s` (6 effective BTC) is NOT stuck: buys 6 BTC from `ok_l` via mode=4,
+    //      and claims 100% of his backed $112 profit (`$40` bk_l + `$72` ok_l) via owner-signed forceHaircut!
+    e.refresh(btc, &ok_l);
+    e.trade(btc, &bob_s, &ok_l, 4, 6 * POS_SCALE);
+    send_ok(&mut e.svm, ix_refresh_leg_signed(e.prog_id, e.dex, btc, bob_s.pfl, bob_s.kp.pubkey(), true), &e.payer, &[&e.payer, &bob_s.kp]);
+    assert_eq!(e.capital(&bob_s), 612 * POS_SCALE, "Cell 5 (HL/Binance UX): Surviving Bob received exact +$112 backed profit (0 stuck funds)!");
+    //   3. Close fresh_l/fresh_s -> OI == 0 -> `adlShort` cleanly resets back to `ADL_ONE`!
+    e.trade(btc, &fresh_l, &fresh_s, 1, 2 * POS_SCALE);
+    assert_eq!(read_u64(&e.svm, &btc, 256), 0);
+    assert_eq!(read_u64(&e.svm, &btc, 296), ADL_ONE, "Cell 5 (HL/Binance UX): Post-ADL market recovered cleanly back to ADL_ONE!");
+
+    // =========================================================================
+    // CELL 6: Permanently Dead Oracle (> maxStaleness) -> WindDown -> Voluntary Close -> ForceClose -> Resolve -> ClaimResolved
+    //         WHILE Live BTC Keeps Trading Uninterrupted!
+    // =========================================================================
+    let fid_dead = [0xDDu8; 32];
+    let (dead_mkt, _, _, _) = mk_pyth_market(&mut e, fid_dead, clk.unix_timestamp, clk.slot);
+    let d_u1 = e.create_trader(300 * POS_SCALE, 200 * POS_SCALE);
+    let d_u2 = e.create_trader(300 * POS_SCALE, 200 * POS_SCALE);
+    e.trade(btc,      &d_u1, &mm,   0, 2 * POS_SCALE); // d_u1 ALSO holds live BTC!
+    e.trade(dead_mkt, &d_u1, &d_u2, 0, 2 * POS_SCALE); // d_u1 + d_u2 on soon-to-die market!
+    // Advance +9,005 slots (> maxStaleness = 9,000), keeping BTC fresh while dead_mkt dies permanently:
+    clk.slot += 9_005; clk.unix_timestamp += 3_602; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 8_800_000_000, clk.unix_timestamp, clk.slot);
+    // Permissionless WindDown on dead_mkt:
+    send_ok(&mut e.svm, ix_start_wind_down(e.prog_id, dead_mkt, d_u1.kp.pubkey()), &e.payer, &[&e.payer, &d_u1.kp]);
+    // Live BTC STILL trades 100% normally (d_u1 adds 1 BTC while dead_mkt is in WindDown!)
+    e.refresh(dead_mkt, &d_u1); e.refresh(btc, &d_u1); e.refresh(btc, &mm);
+    e.trade(btc, &d_u1, &mm, 0, POS_SCALE);
+    // Voluntary close 1 of 2 on dead_mkt during exitWindow at negotiated price $95, then ForceClose remaining 1 after exitWindow!
+    e.trade_ext(dead_mkt, &d_u1, &d_u2, 1, POS_SCALE, 95 * POS_SCALE);
+    clk.slot += 12; clk.unix_timestamp += 5; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    send_ok(&mut e.svm, ix_force_close_pair(e.prog_id, e.dex, dead_mkt, d_u1.pfl, d_u2.pfl), &e.payer, &[&e.payer]);
+    send_ok(&mut e.svm, ix_resolve_market(e.prog_id, e.dex, dead_mkt), &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_claim_resolved(e.prog_id, e.dex, dead_mkt, d_u1.pfl)], &e.payer, &[&e.payer]);
+    let _ = send_ixs_try(&mut e.svm, &[ix_claim_resolved(e.prog_id, e.dex, dead_mkt, d_u2.pfl)], &e.payer, &[&e.payer]);
+    assert_eq!(e.capital(&d_u1) + e.capital(&d_u2), 400 * POS_SCALE, "Cell 6: 100% of user capital preserved across dead-oracle WindDown!");
+    // Clean up d_u1's live BTC position
+    e.refresh(btc, &d_u1); e.refresh(btc, &mm);
+    e.trade(btc, &d_u1, &mm, 1, 3 * POS_SCALE);
+
+    // =========================================================================
+    // CELL 7: Async Cross-Backing (`I_m` Fronting) Full Lifecycle (Normal -> Ramp Auto-Pause -> Post-Ramp Auto-Resume)!
+    // =========================================================================
+    clk.slot += 1; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_000_000_000, clk.unix_timestamp, clk.slot);
+    let c7_l = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    let c7_s = e.create_trader(200 * POS_SCALE, 100 * POS_SCALE);
+    e.trade(btc, &c7_l, &c7_s, 0, 10 * POS_SCALE);
+    // 7a. Calm normal tick (+0.4%): instant 1:1 async fronting!
+    clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 10_040_000_000, clk.unix_timestamp, clk.slot);
+    e.refresh(btc, &c7_l);
+    assert_eq!(read_u64(&e.svm, &btc, 232), 4 * POS_SCALE, "Cell 7a: Normal calm tick fronted $4.00 instantly!");
+    e.refresh(btc, &c7_s); // repaid
+    assert_eq!(read_u64(&e.svm, &btc, 232), 0);
+    // 7b. Saturated outage ramp step (+1.0% clamp): fronting auto-pauses!
+    clk.slot += 2; clk.unix_timestamp += 1; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    crank_pyth(&mut e, btc, btc_adp, btc_feed, btc_pda, fid_btc, 11_000_000_000, clk.unix_timestamp, clk.slot); // clamped +1%
+    e.refresh(btc, &c7_l);
+    assert_eq!(read_u64(&e.svm, &btc, 232), 0, "Cell 7b: Fronting auto-paused during saturated ramp!");
+    // 7c. After RAMP_FRONT_COOLDOWN (3 calm slots): fronting auto-resumes with ZERO admin tx!
+    clk.slot += 3; clk.unix_timestamp += 2; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.refresh(btc, &c7_l);
+    assert!(read_u64(&e.svm, &btc, 232) > 0, "Cell 7c: Fronting auto-resumed after ramp cooldown!");
+    e.refresh(btc, &c7_s);
+    assert_eq!(read_u64(&e.svm, &btc, 232), 0, "Cell 7c: Senior repayment cleared insFronted back to 0!");
+
+    e.check("t26-hl-binance-ux-matrix-final");
+    println!("       [t26] HL/Binance 7-Cell Product-UX Matrix PASSED: hedged 12h -20% survival, partial/stale outage exit, slot-1 de-risk, HLP 0-ADL takeover, post-ADL recovery, WindDown, fronting auto-pause/resume!");
+}
+
+/// Runs all 26 boring everyday exchange + security + HL limit-order + network outage + UX matrix LiteSVM tests as Suite 12.
+pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8], adapter_elf: &[u8], hlp_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
     test_boring_scale_in_and_partial_closes(elf);
@@ -3040,14 +3729,16 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &
     test_22_issue110_self_made_market_overflow_dos_blocked(elf);
     test_23_pr9_mode1_qty_bounded_by_leg_cap(elf);
     test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf);
-    println!("[PASS] Suite 12: 24 Boring Exchange, Audited Security & Hyperliquid-Parity Limit-Order LiteSVM Tests!");
+    test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(elf, limit_matcher_elf, adapter_elf);
+    test_26_hl_binance_product_ux_outage_matrix(elf, matcher_elf, adapter_elf, hlp_elf);
+    println!("[PASS] Suite 12: 26 Boring Exchange, Audited Security, HL Limit-Order, Network Outage & UX Matrix LiteSVM Tests!");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn load_elfs() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn load_elfs() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let elf = std::fs::read(root.join("build/percolator.so"))
             .expect("build/percolator.so missing — run ./scripts/build-and-test.sh first");
@@ -3055,31 +3746,37 @@ mod tests {
             .expect("build/matcher.so missing — run ./scripts/build-and-test.sh first");
         let limit_matcher_elf = std::fs::read(root.join("build/limit_matcher.so"))
             .expect("build/limit_matcher.so missing — run ./scripts/build-and-test.sh first");
-        (elf, matcher_elf, limit_matcher_elf)
+        let adapter_elf = std::fs::read(root.join("build/oracle_adapter.so"))
+            .expect("build/oracle_adapter.so missing — run ./scripts/build-and-test.sh first");
+        let hlp_elf = std::fs::read(root.join("build/hlp_vault.so"))
+            .expect("build/hlp_vault.so missing — run ./scripts/build-and-test.sh first");
+        (elf, matcher_elf, limit_matcher_elf, adapter_elf, hlp_elf)
     }
 
-    #[test] fn boring_01_deposit_withdraw_roundtrip() { let (e, _, _) = load_elfs(); test_boring_deposit_withdraw_roundtrip(&e); }
-    #[test] fn boring_02_simple_long_short_pnl() { let (e, _, _) = load_elfs(); test_boring_simple_long_short_profit_and_loss(&e); }
-    #[test] fn boring_03_scale_in_and_partial_closes() { let (e, _, _) = load_elfs(); test_boring_scale_in_and_partial_closes(&e); }
-    #[test] fn boring_04_position_flip_long_to_short() { let (e, _, _) = load_elfs(); test_boring_position_flip_long_to_short(&e); }
-    #[test] fn boring_05_exec_price_bid_ask_spread() { let (e, _, _) = load_elfs(); test_boring_exec_price_bid_ask_spread(&e); }
-    #[test] fn boring_06_funding_rate_both_directions() { let (e, _, _) = load_elfs(); test_boring_funding_rate_longs_pay_shorts_and_reverse(&e); }
-    #[test] fn boring_07_exit_orders_permutations() { let (e, _, _) = load_elfs(); test_boring_exit_orders_permutations(&e); }
-    #[test] fn boring_08_partial_and_full_liquidation() { let (e, _, _) = load_elfs(); test_boring_partial_and_full_liquidation_normal(&e); }
-    #[test] fn boring_09_liquidation_takeover_hlp_style() { let (e, _, _) = load_elfs(); test_boring_liquidation_takeover_hlp_style(&e); }
-    #[test] fn boring_10_cross_margin_offset_and_profit_reuse() { let (e, _, _) = load_elfs(); test_boring_cross_margin_btc_eth_offset_and_profit_reuse(&e); }
-    #[test] fn boring_11_withdraw_margin_checks_and_freshness() { let (e, _, _) = load_elfs(); test_boring_withdraw_margin_checks_and_freshness(&e); }
-    #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m, _) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
-    #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
-    #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
-    #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
-    #[test] fn boring_16_audited_security_regressions() { let (e, m, _) = load_elfs(); test_audited_security_regressions(&e, &m); }
-    #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
-    #[test] fn boring_18_mode4_netting_flip_and_adversarial_edge_cases() { let (e, _, _) = load_elfs(); test_18_mode4_netting_flip_and_adversarial_edge_cases(&e); }
-    #[test] fn boring_19_flash_arb_crossing_limit_order_matchers() { let (e, _, lm) = load_elfs(); test_19_flash_arb_crossing_limit_order_matchers(&e, &lm); }
-    #[test] fn boring_20_pr8_bankrupt_settlement_blocked_regression() { let (e, m, _) = load_elfs(); test_20_pr8_bankrupt_settlement_blocked_regression(&e, &m); }
-    #[test] fn boring_21_issue107_partial_liq_post_fee_solvency() { let (e, _, _) = load_elfs(); test_21_issue107_partial_liq_post_fee_solvency(&e); }
-    #[test] fn boring_22_issue110_self_made_market_overflow_dos_blocked() { let (e, _, _) = load_elfs(); test_22_issue110_self_made_market_overflow_dos_blocked(&e); }
-    #[test] fn boring_23_pr9_mode1_qty_bounded_by_leg_cap() { let (e, _, _) = load_elfs(); test_23_pr9_mode1_qty_bounded_by_leg_cap(&e); }
-    #[test] fn boring_24_issue113_windowed_ins_draw_and_5slot_censorship() { let (e, _, _) = load_elfs(); test_24_issue113_windowed_ins_draw_and_5slot_censorship(&e); }
+    #[test] fn boring_01_deposit_withdraw_roundtrip() { let (e, _, _, _, _) = load_elfs(); test_boring_deposit_withdraw_roundtrip(&e); }
+    #[test] fn boring_02_simple_long_short_pnl() { let (e, _, _, _, _) = load_elfs(); test_boring_simple_long_short_profit_and_loss(&e); }
+    #[test] fn boring_03_scale_in_and_partial_closes() { let (e, _, _, _, _) = load_elfs(); test_boring_scale_in_and_partial_closes(&e); }
+    #[test] fn boring_04_position_flip_long_to_short() { let (e, _, _, _, _) = load_elfs(); test_boring_position_flip_long_to_short(&e); }
+    #[test] fn boring_05_exec_price_bid_ask_spread() { let (e, _, _, _, _) = load_elfs(); test_boring_exec_price_bid_ask_spread(&e); }
+    #[test] fn boring_06_funding_rate_both_directions() { let (e, _, _, _, _) = load_elfs(); test_boring_funding_rate_longs_pay_shorts_and_reverse(&e); }
+    #[test] fn boring_07_exit_orders_permutations() { let (e, _, _, _, _) = load_elfs(); test_boring_exit_orders_permutations(&e); }
+    #[test] fn boring_08_partial_and_full_liquidation() { let (e, _, _, _, _) = load_elfs(); test_boring_partial_and_full_liquidation_normal(&e); }
+    #[test] fn boring_09_liquidation_takeover_hlp_style() { let (e, _, _, _, _) = load_elfs(); test_boring_liquidation_takeover_hlp_style(&e); }
+    #[test] fn boring_10_cross_margin_offset_and_profit_reuse() { let (e, _, _, _, _) = load_elfs(); test_boring_cross_margin_btc_eth_offset_and_profit_reuse(&e); }
+    #[test] fn boring_11_withdraw_margin_checks_and_freshness() { let (e, _, _, _, _) = load_elfs(); test_boring_withdraw_margin_checks_and_freshness(&e); }
+    #[test] fn boring_12_matcher_amm_single_signer_fills() { let (e, m, _, _, _) = load_elfs(); test_boring_matcher_amm_single_signer_fills(&e, &m); }
+    #[test] fn boring_13_insurance_lp_deposit_yield_withdraw() { let (e, _, _, _, _) = load_elfs(); test_boring_insurance_lp_deposit_fee_yield_withdraw(&e); }
+    #[test] fn boring_14_market_winddown_exit_and_tombstone() { let (e, _, _, _, _) = load_elfs(); test_boring_market_winddown_exit_orders_and_tombstone(&e); }
+    #[test] fn boring_15_security_revival_and_dirty_init_regressions() { let (e, _, _, _, _) = load_elfs(); test_security_revival_and_dirty_init_regressions(&e); }
+    #[test] fn boring_16_audited_security_regressions() { let (e, m, _, _, _) = load_elfs(); test_audited_security_regressions(&e, &m); }
+    #[test] fn boring_17_ins_fronting_lp_nav_sweep_and_freeze_flag() { let (e, _, _, _, _) = load_elfs(); test_17_ins_fronting_lp_nav_sweep_and_freeze_flag(&e); }
+    #[test] fn boring_18_mode4_netting_flip_and_adversarial_edge_cases() { let (e, _, _, _, _) = load_elfs(); test_18_mode4_netting_flip_and_adversarial_edge_cases(&e); }
+    #[test] fn boring_19_flash_arb_crossing_limit_order_matchers() { let (e, _, lm, _, _) = load_elfs(); test_19_flash_arb_crossing_limit_order_matchers(&e, &lm); }
+    #[test] fn boring_20_pr8_bankrupt_settlement_blocked_regression() { let (e, m, _, _, _) = load_elfs(); test_20_pr8_bankrupt_settlement_blocked_regression(&e, &m); }
+    #[test] fn boring_21_issue107_partial_liq_post_fee_solvency() { let (e, _, _, _, _) = load_elfs(); test_21_issue107_partial_liq_post_fee_solvency(&e); }
+    #[test] fn boring_22_issue110_self_made_market_overflow_dos_blocked() { let (e, _, _, _, _) = load_elfs(); test_22_issue110_self_made_market_overflow_dos_blocked(&e); }
+    #[test] fn boring_23_pr9_mode1_qty_bounded_by_leg_cap() { let (e, _, _, _, _) = load_elfs(); test_23_pr9_mode1_qty_bounded_by_leg_cap(&e); }
+    #[test] fn boring_24_issue113_windowed_ins_draw_and_5slot_censorship() { let (e, _, _, _, _) = load_elfs(); test_24_issue113_windowed_ins_draw_and_5slot_censorship(&e); }
+    #[test] fn boring_25_network_outage_reprice_exit_snap_and_zero_ins_drain() { let (e, _, lm, adp, _) = load_elfs(); test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(&e, &lm, &adp); }
+    #[test] fn boring_26_hl_binance_product_ux_outage_matrix() { let (e, m, _, adp, hlp) = load_elfs(); test_26_hl_binance_product_ux_outage_matrix(&e, &m, &adp, &hlp); }
 }

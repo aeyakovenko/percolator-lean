@@ -654,7 +654,7 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
     (hLS : regionDisjoint fLData PflOff.size fSData PflOff.size)
     (hML : regionDisjoint mData MktOff.size fLData PflOff.size)
     (hMS : regionDisjoint mData MktOff.size fSData PflOff.size)
-    (h : applyExecSpread mData fLData fSData qty execPrice s = .ok () s') :
+    (h : applyExecSpread mData fLData fSData qty execPrice true s = .ok () s') :
     (s'.readU64 (fLData + PflOff.capital)).toNat + (s'.readU64 (fSData + PflOff.capital)).toNat =
       (s.readU64 (fLData + PflOff.capital)).toNat + (s.readU64 (fSData + PflOff.capital)).toNat ∧
     (execPrice ≠ 0 →
@@ -684,6 +684,7 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
       have h0 : (markP - markP).toNat = 0 := by rw [u64_sub_toNat_of_le markP markP (Nat.le_refl _)]; omega
       rw [h0]; exact Nat.zero_le _
     · rw [ite_eq_right_of_eq_false _ _ (eq_false heq)] at h
+      simp only [ite_true] at h
       unfold SolanaM.bind at h; dsimp only at h
       let diff := if execPrice > markP then execPrice - markP else markP - execPrice
       let maxBps := s.readU64 (mData + MktOff.maxMoveBps)
@@ -1764,7 +1765,7 @@ theorem creditMarketFromLoser_stock_and_frame
     2. `pfl.capital` NEVER decreases (`s.capital ≤ s'.capital`)!
     3. `pfl.totalReservedMm` and `leg.reservedMm` are unchanged, and stack usage ≤ 8 bytes! -/
 theorem realizeWinnerPnl_stock_and_frame
-    (dData mData fData : Ptr) (slotIdx posPnl rem : UInt64) (forceHaircut : Bool) (s s' : SvmState)
+    (dData mData fData : Ptr) (slotIdx posPnl curSlot rem : UInt64) (forceHaircut : Bool) (s s' : SvmState)
     (hsp : 16 ≤ s.stackSp.toNat)
     (hslot : slotIdx < MAX_LEGS)
     (hdV : regionValid dData DexOff.size)
@@ -1775,7 +1776,7 @@ theorem realizeWinnerPnl_stock_and_frame
     (hDF : regionDisjoint dData DexOff.size fData PflOff.size)
     (hMF : regionDisjoint mData MktOff.size fData PflOff.size)
     (hStock : dexStockExact s dData)
-    (h : realizeWinnerPnl dData mData fData posPnl forceHaircut s = .ok rem s') :
+    (h : realizeWinnerPnl dData mData fData posPnl curSlot forceHaircut s = .ok rem s') :
     dexStockExact s' dData ∧
     s'.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) ∧
     s'.stackSp ≤ s.stackSp ∧
@@ -1996,7 +1997,9 @@ theorem realizeWinnerPnl_stock_and_frame
     · rw [ite_eq_right_of_eq_false _ _ (eq_false hback)] at h
       simp only [SolanaM.bind, rawLoadU16, rawLoadU8, rawLoadU64] at h
       let maxFrontBps := s.readU16 (mData + MktOff.maxFrontBps)
-      by_cases hfr : (decide (maxFrontBps > 0) && decide (totPnl > 0) &&
+      let rampSlot := s.readU64 (mData + MktOff.lastRampSlot)
+      let notRamping := (rampSlot == 0) || decide (curSlot < rampSlot) || decide (curSlot - rampSlot > RAMP_FRONT_COOLDOWN)
+      by_cases hfr : (decide (maxFrontBps > 0) && decide (totPnl > 0) && notRamping &&
           (s.readU8 (mData + MktOff.status) == STATUS_ACTIVE) &&
           (s.readU64 (mData + MktOff.adlLong) == ADL_ONE) &&
           (s.readU64 (mData + MktOff.adlShort) == ADL_ONE)) = true
@@ -2758,7 +2761,7 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       (sf > 0 → posPnl1 = 0 ∧ s1.readU64 (fData + PflOff.capital) = 0 ∧ s1.readU64 (lp + LegOff.lockedMm) = 0) →
       (∀ j : UInt64, j < MAX_LEGS → j ≠ slotIdx → s1.readU64 (legPtrAt fData j + LegOff.lockedMm) = s.readU64 (legPtrAt fData j + LegOff.lockedMm)) →
       (allowBankrupt = false → sf = 0) →
-      ((realizeWinnerPnl dData mData fData posPnl1 forceHaircut).bind fun posPnl2 =>
+      ((realizeWinnerPnl dData mData fData posPnl1 curSlot forceHaircut).bind fun posPnl2 =>
         (storeU64 lp LegOff.posPnl posPnl2).bind fun _ =>
           (syncLegMargins mData fData slotIdx curSlot).bind fun _ => SolanaM.pure sf) s1 = .ok shortfall s' →
       dexStockExact s' dData ∧
@@ -2768,12 +2771,12 @@ theorem settleAndRefreshLeg_preserves_stock_and_no_shielding
       (allowBankrupt = false → shortfall = 0) := by
     intro posPnl1 sf s1 hsp1 hspLe1 hSt1 hV1 hSf1 hOth1 hNoBk1 h2
     unfold SolanaM.bind at h2
-    cases hreal : realizeWinnerPnl dData mData fData posPnl1 forceHaircut s1 with
+    cases hreal : realizeWinnerPnl dData mData fData posPnl1 curSlot forceHaircut s1 with
     | err c st => rw [hreal] at h2; cases h2
     | ok posPnl2 s2 =>
       rw [hreal] at h2; dsimp only at h2
       have ⟨hSt2, hV2, hsp2Le, hsp2Lo, _, hZeroEq, hL2⟩ :=
-        realizeWinnerPnl_stock_and_frame dData mData fData slotIdx posPnl1 posPnl2 forceHaircut s1 s2
+        realizeWinnerPnl_stock_and_frame dData mData fData slotIdx posPnl1 curSlot posPnl2 forceHaircut s1 s2
           (by omega) hslot hdV hmV hfV
           (UInt64.le_trans hspLe1 hdSt) (UInt64.le_trans hspLe1 hmSt) (UInt64.le_trans hspLe1 hfSt)
           hDM hDF hMF hSt1 hreal

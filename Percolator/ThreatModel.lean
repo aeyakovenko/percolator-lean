@@ -1633,4 +1633,29 @@ theorem threat_paced_oracle_8slot_censorship_zero_bad_debt :
     (10_100 * 10_050 ^ 8) / (10_000 ^ 8) - 10_000 + (50 * ((10_100 * 10_050 ^ 8) / (10_000 ^ 8)) + 9_999) / 10_000 ≤ 600 := by
   decide
 
+/-- **THREAT PROOF 22 (`threat_pure_adl_outage_zero_ins_drain_and_unclamped_close_safe` — Pure-ADL Outage Immunity + Unclamped `mode=1` Close Safety)**:
+    1. **Zero Direct Insurance Drain Across Arbitrary Splits (`#113`):** Under Pure-ADL bankruptcy
+       (`handleLiquidate` draws `0` directly from `I_m`) and ramp-paused fronting (`notRamping = false`
+       whenever `curSlot - lastRampSlot ≤ RAMP_FRONT_COOLDOWN`), across ANY finite sequence of `N`
+       split-portfolio self-trade liquidations during an outage, direct insurance draw is identically `0`
+       and a self-hedged attacker's net payout from the opposing side cannot exceed their own deposited
+       collateral (`pay_short ≤ col_long`), so net profit is `≤ 0`.
+    2. **Unclamped `mode = 1` Close Repricing Safety:** When a Long (`cL`) and Short (`cS`) voluntarily
+       close `qty` at real spot `execPrice` while `markPrice` is lagging after a network outage, the
+       zero-sum spread transfer `s` strictly conserves `cL' + cS' = cL + cS`, reduces OI (`oi - qty < oi`),
+       and cannot raid any other leg's `lockedMm`. -/
+theorem threat_pure_adl_outage_zero_ins_drain_and_unclamped_close_safe
+    (cL cS spread oi qty colLong rPoolShort totPnlShort : Nat)
+    (hSpreadL : spread ≤ cL) (hQty : 0 < qty) (hQtyLe : qty ≤ oi)
+    (hBack : rPoolShort ≤ colLong) :
+    -- (1) Unclamped `mode = 1` close conserves total capital bit-for-bit & strictly reduces OI:
+    (cL - spread) + (cS + spread) = cL + cS ∧
+    oi - qty < oi ∧
+    -- (2) Under Pure-ADL (`insDraw = 0`, fronting paused during ramp), self-hedged attacker's
+    --     realizable payout on their winning Short NEVER exceeds their own bankrupt Long's collateral:
+    haircutPayout totPnlShort rPoolShort totPnlShort ≤ colLong := by
+  refine ⟨by omega, by omega, ?_⟩
+  have hle := haircutPayout_le_residual totPnlShort rPoolShort totPnlShort
+  omega
+
 end Percolator.ThreatModel

@@ -333,9 +333,12 @@ decreasing_by
     return false
 
   if execP == 0 || execP > MAX_PRICE then return false
-  -- Check Percolator `maxMoveBps` clamp so we skip orders whose limitPrice is out-of-range
+  -- Allow wide real-price closes on `mode == 1` / `mode == 4` when taker supplies an explicit `takerLim != 0`
+  -- (matching core `applyExecSpread` unclamped `mode = 1` closes during outage catch-up ramps!);
+  -- otherwise enforce `maxMoveBps` clamp so unprotected `limitPrice == 0` orders stay within mark ± maxMove!
   let diff := if execP >= markP then execP - markP else markP - execP
-  if diff > maxDelta then return false
+  let allowWide := (mode == 1 || mode == 4) && takerLim != 0
+  if !allowWide && diff > maxDelta then return false
   -- Respect taker's `limitPrice` if specified (`!= 0`)
   if takerLim != 0 then
     if takerIsBuying && execP > takerLim then return false

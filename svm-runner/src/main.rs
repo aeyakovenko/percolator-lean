@@ -71,11 +71,6 @@ fn read_u8(svm: &LiteSVM, acc: &Address, off: usize) -> u8 {
     a.data[off]
 }
 
-fn read_u16(svm: &LiteSVM, acc: &Address, off: usize) -> u16 {
-    let a = svm.get_account(acc).expect("acc missing");
-    u16::from_le_bytes(a.data[off..off + 2].try_into().unwrap())
-}
-
 fn pfl_free_capital(svm: &LiteSVM, pfl: &Address) -> u64 {
     read_u64(svm, pfl, 88)
 }
@@ -1820,17 +1815,18 @@ fn main() {
             ix_refresh_leg(prog_id, s_dex, rug_mkt, a1_pfl, false),
             ix_liquidate(prog_id, s_dex, sol_mkt, a1_pfl, keeper_tok, mint, s_vault, TOKEN_PROGRAM_ID),
         ], &payer, &[&payer]);
-        // Bug 1B + Firewall assertion: Alice1's `freeCapital` & `SOL.lockedMm` MUST be drained to EXACT 0,
-        // `BTC2.lockedMm == $45` & `RUG.lockedMm == $0.50` MUST remain 100% isolated, and `I_SOL` pays exact $65.50!
-        assert_eq!(pfl_free_capital(&svm, &a1_pfl), 0, "Bug 1B: freeCapital MUST be 0 whenever I_SOL is drawn!");
-        assert_eq!(leg_locked_mm_for_mkt(&svm, &a1_pfl, sol_mid), 0, "Bug 1B: SOL.lockedMm MUST be 0 whenever I_SOL is drawn!");
+        // Bug 1B + Firewall + Pure-ADL assertion: Alice1's `freeCapital` & `SOL.lockedMm` MUST be drained to EXACT 0,
+        // `BTC2.lockedMm == $45` & `RUG.lockedMm == $0.50` MUST remain 100% isolated, AND `I_SOL` draw == EXACT 0 (Pure ADL)!
+        assert_eq!(pfl_free_capital(&svm, &a1_pfl), 0, "Bug 1B: freeCapital MUST be 0 on bankruptcy!");
+        assert_eq!(leg_locked_mm_for_mkt(&svm, &a1_pfl, sol_mid), 0, "Bug 1B: SOL.lockedMm MUST be 0 on bankruptcy!");
         assert_eq!(leg_locked_mm_for_mkt(&svm, &a1_pfl, btc2_mid), 45 * POS_SCALE, "Firewall: BTC2.lockedMm 100% protected from SOL crash!");
         assert_eq!(leg_locked_mm_for_mkt(&svm, &a1_pfl, rug_mid), 500_000, "Firewall: RUG.lockedMm 100% protected from SOL crash!");
         let ins_drawn = sol_ins_pre - read_u64(&svm, &sol_mkt, 224);
-        assert_eq!(ins_drawn, 65_500_000, "I_SOL pays exact $65.50 shortfall ($220 - $104.50 free - $50 SOL.lockedMm)!");
-        // Bob1 receives 100% of his $220 SOL profit ($154.50 from Alice1 + $65.50 from I_SOL)!
-        send_ok(&mut svm, ix_refresh_leg(prog_id, s_dex, sol_mkt, b1_pfl, false), &payer, &[&payer]);
-        assert_eq!(pfl_total_capital(&svm, &b1_pfl), 1_220 * POS_SCALE, "Bob1 receives exact +$220 SOL profit!");
+        assert_eq!(ins_drawn, 0, "Pure ADL on bankruptcy: I_SOL draw == EXACT 0!");
+        // Bob1 receives 100% of Alice1's accessible equity ($154.50) via R_SOL on force-haircut / close; $65.50 shortfall is ADL'd!
+        send_ok(&mut svm, ix_clear_dead_leg(prog_id, s_dex, sol_mkt, b1_pfl), &payer, &[&payer]);
+        send_ok(&mut svm, ix_refresh_leg_signed(prog_id, s_dex, sol_mkt, b1_pfl, b1.pubkey(), true), &payer, &[&payer, &b1]);
+        assert_eq!(pfl_total_capital(&svm, &b1_pfl), 1_154_500_000, "Bob1 receives exact +$154.50 backed SOL profit (Pure ADL, $0 I_SOL drain)!");
         assert_dex_invariants(&svm, &s_dex, &s_vault, &[sol_mkt, btc2_mkt, rug_mkt], &[a1_pfl, b1_pfl], "4B-post-bug1b-firewall");
     }
     // Restore clock slot to slot_post_scam for Suite 5 (4B used isolated s_dex)
@@ -2362,9 +2358,20 @@ fn main() {
         send_err(&mut svm, ix_crank(), &payer, &[&payer], "OracleAdapter rejects spoofed feed owner");
     }
 
-    // Permissionless 4-slot smooth auto-clamped convergence ($100 -> $104 -> $108.16 -> $112.4864 -> $115.00)!
-    // On step 4 (`$112.4864 -> $115.00`, unclamped with `remBudget > 0`), `OracleAdapter` MUST apply nonzero
-    // funding (`fundBps=10`, sign=1 Shorts->Longs) so `kLong` increases strictly beyond the pure `$15.00` mark delta!
+    // Open small 1.0 OI on `comp_mkt2` so we test loaded-market 4-slot smooth auto-clamped convergence
+    // ($100 -> $104 -> $108.16 -> $112.4864 -> $115.00) + PR #9 step-4 nonzero funding guard!
+    let c9_l = Keypair::new(); let c9_s = Keypair::new();
+    svm.airdrop(&c9_l.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&c9_s.pubkey(), 1_000_000_000).unwrap();
+    let c9_lt = create_tok_acc(&mut svm, &mint, &c9_l.pubkey(), 200 * POS_SCALE);
+    let c9_st = create_tok_acc(&mut svm, &mint, &c9_s.pubkey(), 200 * POS_SCALE);
+    let c9_lp = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    let c9_sp = create_prog_acc(&mut svm, &prog_id, PFL_SIZE);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, c9_lp, c9_l.pubkey()), &payer, &[&payer, &c9_l]);
+    send_ok(&mut svm, ix_init_portfolio(prog_id, dex, c9_sp, c9_s.pubkey()), &payer, &[&payer, &c9_s]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, c9_lp, c9_l.pubkey(), c9_lt, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &payer, &[&payer, &c9_l]);
+    send_ok(&mut svm, ix_deposit_collateral(prog_id, dex, c9_sp, c9_s.pubkey(), c9_st, mint, dex_vault, TOKEN_PROGRAM_ID, 100 * POS_SCALE), &payer, &[&payer, &c9_s]);
+    send_ok(&mut svm, ix_trade(prog_id, dex, comp_mkt2, c9_lp, c9_l.pubkey(), c9_sp, c9_s.pubkey(), 0, POS_SCALE), &payer, &[&payer, &c9_l, &c9_s]);
+
     let k_long_pre_crank = read_u64(&svm, &comp_mkt2, 304);
     let mut cu_crank = 0u64;
     for step in 1..=4u64 {
@@ -2376,6 +2383,13 @@ fn main() {
     assert_eq!(read_u64(&svm, &comp_mkt2, 112), 115 * POS_SCALE, "OracleAdapter converged smoothly to $115!");
     let k_long_delta = read_u64(&svm, &comp_mkt2, 304) - k_long_pre_crank;
     assert!(k_long_delta > 15 * POS_SCALE, "PR #9 crank funding guard fix: step 4 MUST pay nonzero funding (kLong delta={} <= 15e6)!", k_long_delta);
+    // Cleanly close temporary 1.0 OI & withdraw so `all_pfls4` invariants remain exact!
+    send_ok(&mut svm, ix_refresh_leg(prog_id, dex, comp_mkt2, c9_sp, false), &payer, &[&payer]);
+    send_ok(&mut svm, ix_trade(prog_id, dex, comp_mkt2, c9_lp, c9_l.pubkey(), c9_sp, c9_s.pubkey(), 1, POS_SCALE), &payer, &[&payer, &c9_l, &c9_s]);
+    let c9_lcap = read_u64(&svm, &c9_lp, 88);
+    let c9_scap = read_u64(&svm, &c9_sp, 88);
+    send_ok(&mut svm, ix_withdraw_collateral(prog_id, dex, c9_lp, c9_l.pubkey(), c9_lt, mint, dex_vault, TOKEN_PROGRAM_ID, c9_lcap), &payer, &[&payer, &c9_l]);
+    send_ok(&mut svm, ix_withdraw_collateral(prog_id, dex, c9_sp, c9_s.pubkey(), c9_st, mint, dex_vault, TOKEN_PROGRAM_ID, c9_scap), &payer, &[&payer, &c9_s]);
 
     // 9A-2: Native Pyth V2 (`PriceUpdateV2`), Chainlink OCR2 (`Transmissions`),
     //       Switchboard On-Demand (`PullFeedAccountData`), AND 2-Leg Composite Ratio (`Pyth / Chainlink`)!
@@ -3316,7 +3330,12 @@ fn main() {
     let limit_matcher_elf = std::fs::read(&limit_matcher_path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", limit_matcher_path, e));
     assert_sbpf_v3_elf(&limit_matcher_path, &limit_matcher_elf);
-    boring_tests::run_all_boring_tests(&elf, &matcher_elf, &limit_matcher_elf);
+    let hlp_path = std::env::args()
+        .nth(6)
+        .unwrap_or_else(|| "build/hlp_vault.so".to_string());
+    let hlp_elf = std::fs::read(&hlp_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", hlp_path, e));
+    assert_sbpf_v3_elf(&hlp_path, &hlp_elf);
+    boring_tests::run_all_boring_tests(&elf, &matcher_elf, &limit_matcher_elf, &adapter_elf, &hlp_elf);
 
     // =========================================================================
     // SUITE 13: Gavel-Style `xy = k` Virtual-Reserve X-Minute Uniform-Price Batch
@@ -4133,10 +4152,6 @@ fn main() {
     //        - Even when strategist pauses deposits (`paused=1`), LPs withdraw 100% principal + spreads + liq fees
     //          AND auto-close `HlpReceipt` with 100% rent lamport refund!
     // =========================================================================
-    let hlp_path = std::env::args()
-        .nth(6)
-        .unwrap_or_else(|| "build/hlp_vault.so".to_string());
-    let hlp_elf = std::fs::read(&hlp_path).unwrap_or_else(|e| panic!("Failed to read {}: {}", hlp_path, e));
     let hlp_prog = Keypair::new().pubkey();
     svm.add_program(hlp_prog, &hlp_elf).expect("hlp_vault ELF load failed");
 

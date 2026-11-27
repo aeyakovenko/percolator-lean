@@ -1020,7 +1020,7 @@ theorem tradeNettedSplit_sound (qty closeB closeS : Nat) :
 theorem tradeNettedCore_zero_qty_rejects (dData mData fBuyer fSeller argsPtr : Ptr) (s : SvmState)
     (hq : s.readU64 (argsPtr + 16) = 0) :
     Program.tradeNettedCore dData mData fBuyer fSeller argsPtr s = .err PErr.invalidParams s := by
-  unfold Program.tradeNettedCore loadU64 rawLoadU64 SolanaM.require
+  unfold Program.tradeNettedCore loadU64 rawLoadU64 loadU8 rawLoadU8 SolanaM.require
   simp only [Bind.bind, SolanaM.bind, hq]
   have h0 : decide ((0 : UInt64) > 0) = false := rfl
   simp only [h0, Bool.false_eq_true, ↓reduceIte, SolanaM.fail]
