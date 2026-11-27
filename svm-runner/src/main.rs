@@ -3123,7 +3123,7 @@ fn main() {
     //   NOT bankrupt — Bug 1C forces full close if `free==0 && lock==0`!)
     let mut p0 = 100_700_000u64;
     let mut p_hi = 100_700_000u64;
-    for step_idx in 0..22 {
+    for step_idx in 0..20 {
         w_slot += 1;
         set_slot(&mut svm, w_slot);
         p_hi = p_hi + (p_hi * 7) / 1000;
@@ -4396,11 +4396,11 @@ fn main() {
         let sl_16a = get_slot(&svm) + 1;
         set_slot(&mut svm, sl_16a);
         send_ok(&mut svm, ix_update_oracle(prog_id, x_btc_mkt, x_btc_orc.pubkey(), 100 * POS_SCALE, 0, 0), &payer, &[&payer, &x_btc_orc]);
-        // RefreshLeg(M_atk, P_atk) + Liquidate(M_atk, P_atk) drains freeCapital -> 0 & M_atk.lockedMm -> 0
-        // (including any keeper liqFee attempt on M_atk!), YET BTC.lockedMm MUST remain EXACT $50!
+        // RefreshLeg on insolvent M_atk is rejected (Custom(107)); Liquidate(M_atk, P_atk) drains
+        // freeCapital -> 0 & M_atk.lockedMm -> 0, YET BTC.lockedMm MUST remain EXACT $50!
+        send_err_custom(&mut svm, ix_refresh_leg(prog_id, x_dex, x_atk_mkt, p_atk, false), &payer, &[&payer], 107, "16A: RefreshLeg rejects insolvent leg");
         send_ixs_ok(&mut svm, &[
             ix_refresh_leg(prog_id, x_dex, x_btc_mkt, p_atk, false),
-            ix_refresh_leg(prog_id, x_dex, x_atk_mkt, p_atk, false),
             ix_liquidate(prog_id, x_dex, x_atk_mkt, p_atk, keeper_tok, mint, x_vault, TOKEN_PROGRAM_ID),
         ], &payer, &[&payer]);
         assert_eq!(pfl_free_capital(&svm, &p_atk), 0, "16A: freeCapital drained to 0 by M_atk");
