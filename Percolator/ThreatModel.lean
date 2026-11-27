@@ -174,6 +174,26 @@ theorem threat_bug1c_bankrupt_liquidation_forces_full_close
     · exact Or.inr (Or.inl h2)
   simp [hc]
 
+/-- **THEOREM (`threat_bug1c_post_fee_no_zero_collateral_partial`)**:
+    **Bug 1C, post-fee**: `handleLiquidate` picks `rawClose` AFTER pricing the fee for the requested
+    close: if a partial close (`reqClose < rawB`) would take a fee `reqFee ≥ availCap = freeCap + legLock`,
+    it closes the full leg instead (re-pricing the fee as `fullFee`). Hence any leg left partially open
+    (`rawClose < rawB`) keeps strictly positive collateral: `liqFee < availCap`. -/
+theorem threat_bug1c_post_fee_no_zero_collateral_partial
+    (rawB reqClose reqFee fullFee availCap : Nat) :
+    let rawClose := if reqClose < rawB ∧ reqFee ≥ availCap then rawB else reqClose
+    let targetFee := if rawClose = reqClose then reqFee else fullFee
+    let liqFee := min targetFee availCap
+    rawClose < rawB → liqFee < availCap := by
+  intro rawClose targetFee liqFee hlt
+  by_cases hc : reqClose < rawB ∧ reqFee ≥ availCap
+  · have : rawClose = rawB := ite_eq_left_of_eq_true _ _ (eq_true hc)
+    omega
+  · have hrc : rawClose = reqClose := ite_eq_right_of_eq_false _ _ (eq_false hc)
+    have htf : targetFee = reqFee := ite_eq_left_of_eq_true _ _ (eq_true hrc)
+    have : liqFee = min reqFee availCap := by simp only [liqFee, htf]
+    omega
+
 /-- **THEOREM (`threat_tradeReduce_unbounded_qty_overcloses`)**:
     Why `Trade(mode = 1)` must bound `qty` by the closing legs' size: on a healthy side
     (`oiSide = rawSide`), `proportionalRawReduction` clamps the raw reduction to the leg's own

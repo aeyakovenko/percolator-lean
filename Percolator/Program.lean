@@ -1356,6 +1356,19 @@ def handleTrade (input : Ptr) : SolanaM Unit := do
   else
     tradeCore dData mData fLData fSData args
 
+/-- Fair gradual deficit-scaled liquidation fee target for closing `rawClose` raw basis:
+    `min(maxFee, max(maxFee / 4, deficit))`, or the full `maxFee` once `shortfall > 0`.
+    The caller caps it at `freeCap + legLock` (NEVER touches any other leg's `lockedMm` firewall!). -/
+def liqTargetFeeU64 (mData : Ptr) (rawClose adlSide markP legMm eq shortfall : UInt64) : SolanaM UInt64 := do
+  let closeEff ← mulDiv64 rawClose adlSide ADL_ONE
+  let notional ← mulDiv64Ceil closeEff markP POS_SCALE
+  let maxFee ← mulDiv64 notional (← loadU64 mData MktOff.liqFeeBps) BPS_DEN
+  if shortfall > 0 then return maxFee
+  let deficit := if legMm > eq then legMm - eq else 0
+  let feeFloor := maxFee >>> 2
+  let g := if deficit > feeFloor then deficit else feeFloor
+  return (if g < maxFee then g else maxFee)
+
 /-- Fair, transparent $O(1)$ liquidation supporting:
     - Partial OR full liquidation (`reqQty = 0` → full leg; `reqQty > 0` → partial `min(reqQty, rawB)`),
     - Gradual deficit-scaled liquidation fee (`min(maxFee, max(maxFee/4, deficit))`, strictly above `otherMm`),
@@ -1406,9 +1419,6 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   let legLock ← loadU64 lp LegOff.lockedMm
   let legMm   ← loadU64 lp LegOff.cachedMm
   let posPnl  ← loadU64 lp LegOff.posPnl
-  -- Bug 1C: if bankrupt (`shortfall > 0 || (freeCap == 0 && legLock == 0)`), ALWAYS force full leg close!
-  let rawClose := if shortfall > 0 || (freeCap == 0 && legLock == 0) || reqQty == 0 || reqQty >= rawB then rawB else reqQty
-  let remRaw   := rawB - rawClose
   -- A1 Fix: require ALL open legs on victim to be refreshed in `curSlot` BEFORE evaluating
   -- per-leg solvency, preventing selective liquidation of a hedged cross-margin spread!
   checkAllLegsFreshLoop fData curSlot 0 false
@@ -1417,20 +1427,17 @@ def handleLiquidate (input : Ptr) : SolanaM Unit := do
   let eq ← checkedAdd64 availCap posPnl
   SolanaM.require (shortfall > 0 || eq < legMm) PErr.positionHealthy
 
-  -- Fair gradual deficit-scaled liquidation fee strictly bounded by `freeCap + legLock`
-  -- (NEVER touches any other leg's `lockedMm` firewall!).
   let markP ← loadU64 mData MktOff.markPrice
   let adlSide ← loadU64 mData (if side == SIDE_LONG then MktOff.adlLong else MktOff.adlShort)
-  let closeEff ← mulDiv64 rawClose adlSide ADL_ONE
-  let notional ← mulDiv64Ceil closeEff markP POS_SCALE
-  let maxFee ← mulDiv64 notional (← loadU64 mData MktOff.liqFeeBps) BPS_DEN
-  let deficit := if legMm > eq then legMm - eq else 0
-  let feeFloor := maxFee >>> 2
-  let targetFee :=
-    if shortfall > 0 then maxFee
-    else
-      let g := if deficit > feeFloor then deficit else feeFloor
-      if g < maxFee then g else maxFee
+  -- Bug 1C: if bankrupt (`shortfall > 0 || (freeCap == 0 && legLock == 0)`), ALWAYS force full leg close!
+  let reqClose := if shortfall > 0 || (freeCap == 0 && legLock == 0) || reqQty == 0 || reqQty >= rawB then rawB else reqQty
+  let reqFee ← liqTargetFeeU64 mData reqClose adlSide markP legMm eq shortfall
+  -- Bug 1C (post-fee): a partial close whose fee takes ALL of `freeCap + legLock` would leave
+  -- `remRaw > 0` open with zero collateral, so close the full leg instead.
+  let rawClose := if reqClose < rawB && reqFee >= availCap then rawB else reqClose
+  let remRaw   := rawB - rawClose
+  let targetFee ← if rawClose == reqClose then pure reqFee
+    else liqTargetFeeU64 mData rawClose adlSide markP legMm eq shortfall
   let liqFee := if targetFee < availCap then targetFee else availCap
   if liqFee > 0 then
     let feeFree := if liqFee < freeCap then liqFee else freeCap
