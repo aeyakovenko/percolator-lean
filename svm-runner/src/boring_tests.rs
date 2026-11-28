@@ -3812,6 +3812,300 @@ pub fn test_26_hl_binance_product_ux_outage_matrix(
 }
 
 /// Runs all 26 boring everyday exchange + security + HL limit-order + network outage + UX matrix LiteSVM tests as Suite 12.
+// =========================================================================
+// TEST 27: BUILT-IN HL/BINANCE FUNDING ENGINE + TAMPER-PROOF PYTH ADAPTER + WASH-ATTACK IMMUNITY
+// =========================================================================
+
+fn pack_funding_cfg(base_int_e6: u16, deadband_e6: u16, max_fund_8h_bps: u16, decay_slots: u16) -> u64 {
+    (base_int_e6 as u64)
+        | ((deadband_e6 as u64) << 16)
+        | ((max_fund_8h_bps as u64) << 32)
+        | ((decay_slots as u64) << 48)
+}
+
+pub fn test_27_builtin_hl_binance_funding_and_wash_attack_immunity(elf: &[u8], adapter_elf: &[u8]) {
+    const PREM_ZERO: u64 = 0x4000_0000_0000_0000;
+    let mut e = BoringEnv::new(elf);
+    let adp_prog = Address::new_unique();
+    e.svm.add_program(adp_prog, adapter_elf).unwrap();
+    let pyth_prog_id = Address::new_unique();
+    let pyth_feed = Address::new_unique();
+    let feed_id: [u8; 32] = [0x42; 32];
+
+    let make_pyth_v2 = |price_e8: i64, pub_ts: i64, posted_slot: u64| -> Vec<u8> {
+        let mut d = vec![0u8; 134];
+        d[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
+        d[40] = 1; // VerificationLevel::Full
+        d[41..73].copy_from_slice(&feed_id);
+        d[73..81].copy_from_slice(&price_e8.to_le_bytes());
+        d[81..89].copy_from_slice(&100_000u64.to_le_bytes());
+        d[89..93].copy_from_slice(&(-8i32).to_le_bytes());
+        d[93..101].copy_from_slice(&pub_ts.to_le_bytes());
+        d[125..133].copy_from_slice(&posted_slot.to_le_bytes());
+        d
+    };
+
+    // 1. Tamper-proof `CreateMarket` `checkFundingCfg` guards:
+    //    - Rejects `tradeFeeBps == 0` when `fundingCfg != 0` (free wash blocked!)
+    //    - Rejects positive-EV wash config (`maxFund8hBps * decaySlots > tradeFeeBps * 72_000`)
+    //    - Rejects `maxMoveBps * decaySlots > tradeFeeBps * 72_000`
+    //    - Rejects `decaySlots == 0` or `maxFund8hBps == 0`
+    let good_cfg = pack_funding_cfg(100, 500, 100, 1800); // +0.01%/8h, ±5bps deadband, ±1%/8h cap, 1800-slot (~12m) decay
+    let bad_wash_cfg = pack_funding_cfg(100, 500, 500, 3600); // 500*3600 = 1.8M > 5*72000 = 360k -> REJECT!
+    let bad_zero_decay = pack_funding_cfg(100, 500, 100, 0);
+    let ctok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    for (label, fee_bps, cfg) in [
+        ("zero tradeFee with funding", 0u64, good_cfg),
+        ("positive-EV wash fundingCfg", 5u64, bad_wash_cfg),
+        ("zero decaySlots", 5u64, bad_zero_decay),
+    ] {
+        let bad_mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+        send_err_custom(
+            &mut e.svm,
+            ix_create_market(
+                e.prog_id, e.dex, bad_mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(),
+                ctok, e.fee_vault, 100_000 * POS_SCALE, 10, 3000, cfg,
+                1000, 600, 50, fee_bps, 100, 2500, 10_000 * POS_SCALE,
+            ),
+            &e.payer, &[&e.payer, &e.admin], 103, label,
+        );
+    }
+
+    // 2. Create BTC market ($100,000, tradeFee=5bps, maxMove=100bps, HL/Binance built-in funding),
+    //    reject external `fundE6 != 0` injection, then wire tamper-proof Pyth OracleAdapter & burn `marketAdmin`!
+    let mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let btc_init = 100_000 * POS_SCALE; // $100,000.00
+    send_ok(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, e.dex, mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(),
+            ctok, e.fee_vault, btc_init, 10, 3000, good_cfg,
+            1000, 600, 50, 5, 100, 2500, 10_000 * POS_SCALE,
+        ),
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    e.markets.push(mkt);
+    assert_eq!(read_u64(&e.svm, &mkt, 400), good_cfg);
+    assert_eq!(read_u64(&e.svm, &mkt, 408), PREM_ZERO);
+
+    let alice = e.create_trader(200_000 * POS_SCALE, 200_000 * POS_SCALE);
+    let bob   = e.create_trader(200_000 * POS_SCALE, 200_000 * POS_SCALE);
+    let wash1 = e.create_trader(200_000 * POS_SCALE, 200_000 * POS_SCALE);
+    let wash2 = e.create_trader(200_000 * POS_SCALE, 200_000 * POS_SCALE);
+
+    // Open 1 BTC Long (Alice) vs 1 BTC Short (Bob) at exact mark $100,000 (0 premium)
+    e.trade_ext(mkt, &alice, &bob, 0, POS_SCALE, btc_init);
+    assert_eq!(read_u64(&e.svm, &mkt, 408), PREM_ZERO, "At-mark fill keeps premiumEwma == PREM_ZERO");
+
+    // External oracle attempting to inject fake `fundE6 != 0` on built-in-funding market MUST REJECT (103)!
+    e.advance_slot(10);
+    send_err_custom(
+        &mut e.svm,
+        ix_update_oracle(e.prog_id, mkt, e.oracle.pubkey(), btc_init, 0, 50_000),
+        &e.payer, &[&e.payer, &e.oracle], 103,
+        "External fundE6 injection MUST reject (Custom 103) when built-in fundingCfg != 0!",
+    );
+
+    // Wire tamper-proof Pyth Pull OracleAdapter PDA as `Market.oracleAuth` and BURN `marketAdmin` to 0!
+    let adp = create_prog_acc(&mut e.svm, &adp_prog, 352);
+    let (orac_pda, orac_bump) = Address::find_program_address(&[b"orac", adp.as_ref()], &adp_prog);
+    let mut clk = e.svm.get_sysvar::<Clock>();
+    clk.unix_timestamp = 1_750_000_000;
+    e.svm.set_sysvar(&clk);
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot), // $100,000.00
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    let mut init_adp_data = vec![0u8; 60];
+    init_adp_data[0] = 0; // Init
+    init_adp_data[1] = orac_bump;
+    init_adp_data[2] = 1; // FEED_PYTH_V2
+    init_adp_data[4..12].copy_from_slice(&3600u64.to_le_bytes()); // maxFeedAge (s)
+    init_adp_data[12..20].copy_from_slice(&200u64.to_le_bytes()); // maxConfBps
+    init_adp_data[20..28].copy_from_slice(&25u64.to_le_bytes());  // legacy fundBps (auto-ignored since mkt.fundingCfg != 0!)
+    init_adp_data[28..60].copy_from_slice(&feed_id);
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: adp_prog,
+            accounts: vec![
+                AccountMeta::new(adp, false),
+                AccountMeta::new_readonly(e.admin.pubkey(), true),
+                AccountMeta::new_readonly(e.prog_id, false),
+                AccountMeta::new_readonly(mkt, false),
+                AccountMeta::new_readonly(pyth_feed, false),
+            ],
+            data: init_adp_data,
+        },
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    // Rotate `oracleAuth -> orac_pda` (role=1), then permanently BURN `marketAdmin -> 0` (role=0, 2 accs)!
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: e.prog_id,
+            accounts: vec![
+                AccountMeta::new(mkt, false),
+                AccountMeta::new_readonly(e.admin.pubkey(), true),
+                AccountMeta::new_readonly(orac_pda, false),
+            ],
+            data: vec![3, 1],
+        },
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    send_ok(
+        &mut e.svm,
+        Instruction {
+            program_id: e.prog_id,
+            accounts: vec![
+                AccountMeta::new(mkt, false),
+                AccountMeta::new_readonly(e.admin.pubkey(), true),
+            ],
+            data: vec![3, 0],
+        },
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    assert_eq!(read_u64(&e.svm, &mkt, 80), 0, "marketAdmin permanently burned!");
+    let prog_id = e.prog_id;
+    let ix_crank = || Instruction {
+        program_id: adp_prog,
+        accounts: vec![
+            AccountMeta::new_readonly(adp, false),
+            AccountMeta::new(mkt, false),
+            AccountMeta::new_readonly(pyth_feed, false),
+            AccountMeta::new_readonly(orac_pda, false),
+            AccountMeta::new_readonly(prog_id, false),
+        ],
+        data: vec![1],
+    };
+
+    // 3. Calm-Market Baseline (+0.01%/8h): advance +710 more slots (10 + 710 = exact 720 slots = 1% of 8h) and crank Pyth BTC @ $100,000!
+    //    Expected exact built-in funding = floor(100_000e6 * 100 * 720 / 72_000_000_000) = 100_000 ($0.10)!
+    let a0 = e.capital(&alice);
+    let b0 = e.capital(&bob);
+    clk.slot += 710; clk.unix_timestamp += 284; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot),
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &bob);
+    assert_eq!(a0 - e.capital(&alice), 100_000, "Calm market: Alice (Long) pays exact $0.10 baseline (+0.01%/8h over 720 slots)!");
+    assert_eq!(e.capital(&bob) - b0, 100_000, "Calm market: Bob (Short) receives exact $0.10 baseline!");
+    e.check("t27-calm-baseline");
+
+    // 4. Deadband (±5 bps) + 1-Atom Dust-Wash Immunity:
+    //    Trade inside deadband (+3 bps = $100,030) + tiny 100-atom dust at +90 bps ($100,900).
+    //    Next crank after 720 slots MUST still pay exact baseline $0.10!
+    e.trade_ext(mkt, &wash1, &wash2, 0, POS_SCALE / 10, 100_030 * POS_SCALE);
+    e.trade_ext(mkt, &wash1, &wash2, 0, 100, 100_900 * POS_SCALE); // dust (fee=0 or tiny weight)
+    let a1 = e.capital(&alice);
+    let b1 = e.capital(&bob);
+    clk.slot += 720; clk.unix_timestamp += 288; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot),
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &wash1);
+    e.refresh(mkt, &bob);
+    e.refresh(mkt, &wash2);
+    assert_eq!(a1 - e.capital(&alice), 100_000, "Deadband + dust immunity: funding stays at exact $0.10 baseline!");
+    assert_eq!(e.capital(&bob) - b1, 100_000);
+
+    // 5. Bullish Premium (+90 bps) + Self-Wash Negative-EV Verification!
+    //    wash1 & wash2 wash-trade at +90 bps ($100,900) to spike funding.
+    //    Track total combined wash equity before & after: fees burned MUST strictly exceed funding extracted!
+    let w_before = e.capital(&wash1) + e.capital(&wash2);
+    for _ in 0..4 {
+        e.trade_ext(mkt, &wash1, &wash2, 0, POS_SCALE / 2, 100_900 * POS_SCALE);
+    }
+    let prem_bull = read_u64(&e.svm, &mkt, 408);
+    assert!(prem_bull > PREM_ZERO + 5_000, "Sustained +90bps trades pushed premiumEwma > +50bps (got +{} E6)", prem_bull - PREM_ZERO);
+    let a2 = e.capital(&alice);
+    let b2 = e.capital(&bob);
+    clk.slot += 720; clk.unix_timestamp += 288; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot),
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &wash1);
+    e.refresh(mkt, &bob);
+    e.refresh(mkt, &wash2);
+    let bull_fund = a2 - e.capital(&alice);
+    assert!(bull_fund > 200_000, "Bullish premium charged Longs > $0.20 (actual ${:.4})!", bull_fund as f64 / 1e6);
+    assert_eq!(e.capital(&bob) - b2, bull_fund, "Exact zero-sum: Bob received 100% of Alice's bullish funding!");
+    let w_after = e.capital(&wash1) + e.capital(&wash2);
+    assert!(w_before - w_after > bull_fund, "Self-wash negative-EV: wash fees burned (${:.2}) strictly exceed funding shift (${:.4})!",
+        (w_before - w_after) as f64 / 1e6, bull_fund as f64 / 1e6);
+
+    // 6. Automatic Time Decay back to PREM_ZERO after >= decaySlots (1800 slots) quiet!
+    clk.slot += 1800; clk.unix_timestamp += 720; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot),
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    assert_eq!(read_u64(&e.svm, &mkt, 408), PREM_ZERO, "Quiet period >= decaySlots decayed premiumEwma cleanly back to PREM_ZERO!");
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &wash1);
+    e.refresh(mkt, &bob);
+    e.refresh(mkt, &wash2);
+
+    // 7. Bearish Discount (-90 bps = $99,100) -> Negative Funding (Shorts pay Longs!)
+    for _ in 0..4 {
+        e.trade_ext(mkt, &wash1, &wash2, 0, POS_SCALE / 2, 99_100 * POS_SCALE);
+    }
+    assert!(read_u64(&e.svm, &mkt, 408) < PREM_ZERO - 3_000, "Bearish fills pushed premiumEwma negative!");
+    let a3 = e.capital(&alice);
+    let b3 = e.capital(&bob);
+    clk.slot += 720; clk.unix_timestamp += 288; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(10_000_000_000_000, clk.unix_timestamp, clk.slot),
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    // Shorts lose here -> refresh Shorts (bob, wash2) FIRST so R_m backs Longs (alice, wash1) 1:1!
+    e.refresh(mkt, &bob);
+    e.refresh(mkt, &wash2);
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &wash1);
+    let bear_fund = e.capital(&alice) - a3;
+    assert!(bear_fund > 100_000, "Bearish discount: Shorts paid Longs > $0.10 (actual ${:.4})!", bear_fund as f64 / 1e6);
+    assert_eq!(b3 - e.capital(&bob), bear_fund, "Exact zero-sum negative funding!");
+
+    // 8. Saturated Outage Catch-Up Ramp (diff == maxAllowed -> remBudget == 0) accrues EXACT $0 funding!
+    let a4 = e.capital(&alice);
+    let b4 = e.capital(&bob);
+    clk.slot += 100; clk.unix_timestamp += 40; e.svm.set_sysvar(&clk); e.slot = clk.slot;
+    e.svm.set_account(pyth_feed, Account {
+        lamports: 10_000_000,
+        data: make_pyth_v2(9_000_000_000_000, clk.unix_timestamp, clk.slot), // $90,000 (-10% crash -> saturated -1% ramp!)
+        owner: pyth_prog_id, executable: false, rent_epoch: 0,
+    }).unwrap();
+    send_ok(&mut e.svm, ix_crank(), &e.payer, &[&e.payer]);
+    e.refresh(mkt, &alice);
+    e.refresh(mkt, &wash1);
+    e.refresh(mkt, &bob);
+    e.refresh(mkt, &wash2);
+    assert_eq!(read_u64(&e.svm, &mkt, 112), 99_000 * POS_SCALE, "Saturated -1% ramp step ($100k -> $99k)");
+    assert_eq!(a4 - e.capital(&alice), 1_000 * POS_SCALE, "Exact $1,000 price move + $0.00 funding during saturated ramp!");
+    assert_eq!(e.capital(&bob) - b4, 1_000 * POS_SCALE);
+    e.check("t27-after-saturated-ramp");
+
+    println!("       [t27] Built-In HL/Binance Funding Engine PASSED: tamper-proof Pyth adapter (admin burned), +0.01%/8h baseline, ±5bps deadband, +bull/-bear funding, wash negative-EV, time decay & $0 ramp funding!");
+}
+
 pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &[u8], adapter_elf: &[u8], hlp_elf: &[u8]) {
     test_boring_deposit_withdraw_roundtrip(elf);
     test_boring_simple_long_short_profit_and_loss(elf);
@@ -3839,7 +4133,8 @@ pub fn run_all_boring_tests(elf: &[u8], matcher_elf: &[u8], limit_matcher_elf: &
     test_24_issue113_windowed_ins_draw_and_5slot_censorship(elf);
     test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(elf, limit_matcher_elf, adapter_elf);
     test_26_hl_binance_product_ux_outage_matrix(elf, matcher_elf, adapter_elf, hlp_elf);
-    println!("[PASS] Suite 12: 26 Boring Exchange, Audited Security, HL Limit-Order, Network Outage & UX Matrix LiteSVM Tests!");
+    test_27_builtin_hl_binance_funding_and_wash_attack_immunity(elf, adapter_elf);
+    println!("[PASS] Suite 12: 27 Boring Exchange, Audited Security, HL Limit-Order, Network Outage, UX Matrix & Built-In Funding LiteSVM Tests!");
 }
 
 #[cfg(test)]
@@ -3887,4 +4182,5 @@ mod tests {
     #[test] fn boring_24_issue113_windowed_ins_draw_and_5slot_censorship() { let (e, _, _, _, _) = load_elfs(); test_24_issue113_windowed_ins_draw_and_5slot_censorship(&e); }
     #[test] fn boring_25_network_outage_reprice_exit_snap_and_zero_ins_drain() { let (e, _, lm, adp, _) = load_elfs(); test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(&e, &lm, &adp); }
     #[test] fn boring_26_hl_binance_product_ux_outage_matrix() { let (e, m, _, adp, hlp) = load_elfs(); test_26_hl_binance_product_ux_outage_matrix(&e, &m, &adp, &hlp); }
+    #[test] fn boring_27_builtin_hl_binance_funding_and_wash_attack_immunity() { let (e, _, _, adp, _) = load_elfs(); test_27_builtin_hl_binance_funding_and_wash_attack_immunity(&e, &adp); }
 }

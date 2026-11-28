@@ -22,7 +22,7 @@ const SPL_TOKEN_RENT_MIN: u64 = 2_039_280;
 
 // Exact v2 layout constants matching Percolator/Layout.lean & Percolator/RewardModule.lean
 const DEX_SIZE: usize = 208;
-const MKT_SIZE: usize = 400;
+const MKT_SIZE: usize = 416;
 const PFL_SIZE: usize = 976;
 const INS_SIZE: usize = 88;
 const REW_SIZE: usize = 400;

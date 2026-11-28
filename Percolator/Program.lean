@@ -641,6 +641,97 @@ def handleUpdateCreateFee (input : Ptr) : SolanaM Unit := do
     SolanaM.require (!(← pubkeyIsZero (AccountView.keyPtr effNewAdmin))) PErr.invalidParams
     pubkeyCopy (dData + DexOff.admin) (AccountView.keyPtr effNewAdmin)
 
+/-- Validate immutable packed `fundingCfg` (`0` = disabled; non-zero = built-in HL/Binance funding):
+    - bits `0..15`:  `baseInterestE6` (`100` = `+0.01% / 8h`, must be `<= maxFundBps * 100`),
+    - bits `16..31`: `deadbandE6` (`500` = `±0.05%`, must be `<= MAX_FUND_DEADBAND_E6`),
+    - bits `32..47`: `maxFund8hBps` (`1..MAX_FUND_8H_BPS`, e.g. `100` = `±1% / 8h`),
+    - bits `48..63`: `premDecaySlots` (`>= 1`, e.g. `1800` ≈ 12 min).
+    Enforces universal negative-EV wash-manipulation guard (`max(maxFundBps, maxMoveBps) * decaySlots
+    <= tradeFeeBps * SLOTS_PER_8H`) so NO wash trade of ANY size (even 1-sided `mode = 2/3`!) can
+    ever extract more funding over `decaySlots` than it burns in non-refundable `tradeFeeBps`! -/
+@[inline] def checkFundingCfg (fundingCfg tradeFeeBps maxMoveBps : UInt64) : SolanaM Unit := do
+  if fundingCfg != 0 then
+    let baseIntE6  := fundingCfg &&& 0xFFFF
+    let deadbandE6 := (fundingCfg >>> 16) &&& 0xFFFF
+    let maxFundBps := (fundingCfg >>> 32) &&& 0xFFFF
+    let decaySlots := (fundingCfg >>> 48) &&& 0xFFFF
+    let feeBudget  := tradeFeeBps * SLOTS_PER_8H
+    SolanaM.require (tradeFeeBps > 0 && maxFundBps >= 1 && maxFundBps <= MAX_FUND_8H_BPS &&
+                     decaySlots >= 1 && baseIntE6 <= maxFundBps * 100 &&
+                     deadbandE6 <= MAX_FUND_DEADBAND_E6 &&
+                     maxFundBps * decaySlots <= feeBudget &&
+                     maxMoveBps * decaySlots <= feeBudget) PErr.invalidParams
+
+/-- Pure built-in HL/Binance funding step computed deterministically inside `handleUpdateOracle`:
+    1. Exact HL/Binance deadband formula (in signed E6 per 8h):
+       `rate8h = clamp(prem + clamp(baseInt - prem, -deadband, +deadband), -maxFund8h, +maxFund8h)`.
+    2. Time-scaled over `SLOTS_PER_8H = 72_000` slots (8h @ 400ms) and strictly capped to
+       `remBudget = maxAllowed - |newPrice - oldPrice|` (so `diff + fundE6 <= maxAllowed` ALWAYS!).
+    3. Linear time decay of `premiumEwma` toward `PREM_ZERO` over `decaySlots`. -/
+@[inline] def computeBuiltInFunding
+    (fundingCfg premBiased oldPrice remBudget dt : UInt64) :
+    SolanaM (UInt8 × UInt64 × UInt64) := do
+  let baseIntE6  := fundingCfg &&& 0xFFFF
+  let deadbandE6 := (fundingCfg >>> 16) &&& 0xFFFF
+  let maxFundE6  := ((fundingCfg >>> 32) &&& 0xFFFF) * 100
+  let decaySlots := (fundingCfg >>> 48) &&& 0xFFFF
+  let cur := if premBiased == 0 then PREM_ZERO else premBiased
+  let baseBiased := PREM_ZERO + baseIntE6
+  let rateBiased :=
+    if baseBiased >= cur then
+      let d := baseBiased - cur
+      cur + (if d < deadbandE6 then d else deadbandE6)
+    else
+      let d := cur - baseBiased
+      cur - (if d < deadbandE6 then d else deadbandE6)
+  let fSign : UInt8 := if rateBiased >= PREM_ZERO then 0 else 1
+  let rateMagRaw := if rateBiased >= PREM_ZERO then rateBiased - PREM_ZERO else PREM_ZERO - rateBiased
+  let rateMagE6 := if rateMagRaw < maxFundE6 then rateMagRaw else maxFundE6
+  let rawFundE6 ←
+    if rateMagE6 == 0 || dt == 0 || remBudget == 0 then pure 0
+    else mulDiv64 oldPrice (rateMagE6 * dt) (POS_SCALE * SLOTS_PER_8H)
+  let fundE6 := if rawFundE6 < remBudget then rawFundE6 else remBudget
+  let nextPrem ←
+    if decaySlots == 0 || dt >= decaySlots then pure PREM_ZERO
+    else do
+      let keep := decaySlots - dt
+      if cur >= PREM_ZERO then do
+        let dec ← mulDiv64 (cur - PREM_ZERO) keep decaySlots
+        pure (PREM_ZERO + dec)
+      else do
+        let dec ← mulDiv64 (PREM_ZERO - cur) keep decaySlots
+        pure (PREM_ZERO - dec)
+  return (fSign, fundE6, nextPrem)
+
+/-- OI-weighted, fee-gated perp premium EWMA update called on `mode = 0` and `mode = 2/3` fills
+    (`execPrice != 0 && fee > 0`; never called on unclamped `mode = 1` outage closes!):
+    - Clamps signed sample premium `(execPrice - markP) * 10^6 / markP` to `±maxMoveBps * 100`,
+    - Weights by `min(25%, qty / oiRef)` so dust trades shift `premiumEwma` by ~0 and wash
+      manipulation pays real non-refundable `tradeFeeBps`! -/
+@[noinline] def updatePremiumEwma (mData : Ptr) (qty execPrice markP oiRef fee : UInt64) : SolanaM Unit := do
+  if execPrice == 0 || fee == 0 || oiRef == 0 || markP == 0 then return ()
+  let cfg ← loadU64 mData MktOff.fundingCfg
+  if cfg == 0 then return ()
+  let isPos := execPrice >= markP
+  let pDiff := if isPos then execPrice - markP else markP - execPrice
+  let rawSample ← mulDiv64 pDiff POS_SCALE markP
+  let maxPremE6 := (← loadU64 mData MktOff.maxMoveBps) * 100
+  let sampleMag := if rawSample < maxPremE6 then rawSample else maxPremE6
+  let sampleBiased := if isPos then PREM_ZERO + sampleMag else PREM_ZERO - sampleMag
+  let rawW ← mulDiv64 qty POS_SCALE oiRef
+  let wE6 := if rawW < MAX_PREM_WEIGHT_E6 then rawW else MAX_PREM_WEIGHT_E6
+  if wE6 == 0 then return ()
+  let curBiased ← loadU64 mData MktOff.premiumEwma
+  let cur := if curBiased == 0 then PREM_ZERO else curBiased
+  let nextBiased ←
+    if sampleBiased >= cur then do
+      let step ← mulDiv64 (sampleBiased - cur) wE6 POS_SCALE
+      pure (cur + step)
+    else do
+      let step ← mulDiv64 (cur - sampleBiased) wE6 POS_SCALE
+      pure (cur - step)
+  storeU64 mData MktOff.premiumEwma nextBiased
+
 def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let (dex, mkt, mint, oracleAuth, creatorRaw, creatorTok, feeVaultTokRaw, tokProg, ix, progId) ← parse8 input
   requireNonDup dex; requireNonDup mkt; requireNonDup mint; requireNonDup oracleAuth
@@ -661,7 +752,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let initPrice     ← loadU64 ix.ptr 4
   let exitWindow    ← loadU64 ix.ptr 12
   let maxStaleness  ← loadU64 ix.ptr 20
-  let reservedPad   ← loadU64 ix.ptr 28
+  let fundingCfg    ← loadU64 ix.ptr 28
   let imBps         ← loadU64 ix.ptr 36
   let mmBps         ← loadU64 ix.ptr 44
   let liqFeeBps     ← loadU64 ix.ptr 52
@@ -679,7 +770,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
     SolanaM.require (!(← pubkeyIsZero (ix.ptr + 108))) PErr.invalidParams
   SolanaM.require (initPrice > 0 && initPrice <= MAX_PRICE) PErr.invalidParams
   SolanaM.require (exitWindow >= MIN_EXIT_WINDOW && exitWindow <= MAX_EXIT_WINDOW &&
-                   maxStaleness >= 1 && maxStaleness <= MAX_STALENESS && reservedPad == 0) PErr.invalidParams
+                   maxStaleness >= 1 && maxStaleness <= MAX_STALENESS) PErr.invalidParams
   SolanaM.require (mmBps > 0 && mmBps < imBps && imBps <= BPS_DEN) PErr.invalidParams
   -- Gap #1 + #7 Fix (Solana K+1 = 5-slot triggering + 4-slot leader window + liqFee at p5!):
   -- `k5MoveBps = 5*m + ceil(12*m^2 / 10000)` strictly bounds `((10000+m)^5 - 10000^5) / 10000^4`
@@ -691,6 +782,7 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← checkedAdd64 k5MoveBps liqAtP5) <= mmBps &&
                    (← checkedAdd64 mmBps maxMoveBps) <= imBps) PErr.invalidParams
   SolanaM.require (tradeFeeBps <= 1000 && maxOi > 0 && maxOi <= MAX_OI) PErr.invalidParams
+  checkFundingCfg fundingCfg tradeFeeBps maxMoveBps
   let initNot ← mulDiv64Ceil maxOi initPrice POS_SCALE
   SolanaM.require (initNot <= MAX_MKT_NOTIONAL) PErr.invalidParams
 
@@ -732,6 +824,8 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   storeU64 mData MktOff.rewardBps rewardBps
   if rewardBps > 0 then
     pubkeyCopy (mData + MktOff.rewardRecipient) (ix.ptr + 108)
+  storeU64 mData MktOff.fundingCfg fundingCfg
+  storeU64 mData MktOff.premiumEwma PREM_ZERO
 
 /-- Burn (`n == 2` or zero key) or transfer `marketAdmin` (`role == 0`), or rotate `oracleAuth` (`role == 1`). -/
 def handleUpdateMarketAuth (input : Ptr) : SolanaM Unit := do
@@ -789,11 +883,15 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
   let rL   ← loadU64 mData MktOff.rawBasisLong
   let rS   ← loadU64 mData MktOff.rawBasisShort
   let isEmpty := oiL == 0 && oiS == 0 && rL == 0 && rS == 0
+  let mut effFundSign : UInt8 := 0
+  let mut effFundE6   : UInt64 := 0
   if isEmpty then
     -- Empty market fast-snap: once all positions have closed out (`OI == 0 ∧ rawBasis == 0`),
-    -- snap `markPrice` directly to live spot in 1 slot (requiring `fundE6 == 0`) and clear ramp pause!
+    -- snap `markPrice` directly to live spot in 1 slot (requiring `fundE6 == 0`), clear ramp pause,
+    -- and reset `premiumEwma` cleanly to neutral `PREM_ZERO`!
     SolanaM.require (fundE6 == 0) PErr.oracleClamp
     storeU64 mData MktOff.lastRampSlot 0
+    storeU64 mData MktOff.premiumEwma PREM_ZERO
   else
     -- Loaded market paced clamp (`dt == 1` half-step pacing): doubles censorship resistance
     -- (5-slot & 8-slot double-leader censorship stay within `mmBps` with 0 bad debt, while `dt >= 2`
@@ -803,7 +901,26 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
     let effMaxMove :=
       if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
     let maxAllowed ← mulDiv64 oldPrice effMaxMove BPS_DEN
-    SolanaM.require ((← checkedAdd64 diff fundE6) <= maxAllowed) PErr.oracleClamp
+    let fundingCfg ← loadU64 mData MktOff.fundingCfg
+    if fundingCfg != 0 then
+      -- Built-in trustless HL/Binance funding: reject external funding injection (`fundE6 == 0`),
+      -- clamp price move, compute `dt`-scaled deadband funding strictly inside `maxAllowed - diff`,
+      -- and decay `premiumEwma` toward `PREM_ZERO`!
+      SolanaM.require (fundE6 == 0) PErr.invalidParams
+      SolanaM.require (diff <= maxAllowed) PErr.oracleClamp
+      let remBudget := maxAllowed - diff
+      let dtRaw := curSlot - lastSlot
+      let maxStale ← loadU64 mData MktOff.maxStaleness
+      let dt := if dtRaw < maxStale then dtRaw else maxStale
+      let curPrem ← loadU64 mData MktOff.premiumEwma
+      let (fs, fe, nextPrem) ← computeBuiltInFunding fundingCfg curPrem oldPrice remBudget dt
+      storeU64 mData MktOff.premiumEwma nextPrem
+      effFundSign := fs
+      effFundE6   := fe
+    else
+      SolanaM.require ((← checkedAdd64 diff fundE6) <= maxAllowed) PErr.oracleClamp
+      effFundSign := fundSign
+      effFundE6   := fundE6
     let rampThresh := maxAllowed - (maxAllowed >>> 2)
     if maxAllowed > 0 && diff >= rampThresh then
       storeU64 mData MktOff.lastRampSlot curSlot
@@ -827,19 +944,19 @@ def handleUpdateOracle (input : Ptr) : SolanaM Unit := do
     subU64At mData MktOff.kLong  dkL
     addU64At mData MktOff.kShort (← mulDiv64 adlS diff ADL_ONE)
 
-  if fundE6 > 0 then
-    if fundSign == 0 then
-      let dkL ← if rL == 0 then pure fundE6 else mulDiv64Ceil oiL fundE6 rL
+  if effFundE6 > 0 then
+    if effFundSign == 0 then
+      let dkL ← if rL == 0 then pure effFundE6 else mulDiv64Ceil oiL effFundE6 rL
       subU64At mData MktOff.kLong  dkL
-      addU64At mData MktOff.kShort (← mulDiv64 adlS fundE6 ADL_ONE)
+      addU64At mData MktOff.kShort (← mulDiv64 adlS effFundE6 ADL_ONE)
     else
-      let dkS ← if rS == 0 then pure fundE6 else mulDiv64Ceil oiS fundE6 rS
+      let dkS ← if rS == 0 then pure effFundE6 else mulDiv64Ceil oiS effFundE6 rS
       subU64At mData MktOff.kShort dkS
-      addU64At mData MktOff.kLong  (← mulDiv64 adlL fundE6 ADL_ONE)
+      addU64At mData MktOff.kLong  (← mulDiv64 adlL effFundE6 ADL_ONE)
 
   storeU64 mData MktOff.markPrice newPrice
   storeU64 mData MktOff.lastOracleSlot curSlot
-  log64 EvtTag.oracle (← loadU64 mData MktOff.marketId) newPrice fundSign.toUInt64 fundE6
+  log64 EvtTag.oracle (← loadU64 mData MktOff.marketId) newPrice effFundSign.toUInt64 effFundE6
 
 def handleInitPortfolio (input : Ptr) : SolanaM Unit := do
   let (dex, pfl, owner, _, progId) ← parseStrict3 input PErr.aliasedAccounts
@@ -1179,6 +1296,7 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
       storeU64 fLData PflOff.capital (cL - fee)
       storeU64 fSData PflOff.capital (cS - fee)
       creditTradeFee dData mData (← checkedAdd64 fee fee)
+      updatePremiumEwma mData qty execPrice markP maxOi' fee
 
     if sL == SIDE_FLAT then
       storeU8  lpL LegOff.side SIDE_LONG
@@ -1339,6 +1457,7 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
       SolanaM.require (cBuy >= fee) PErr.insufficientFunds
       storeU64 fSData PflOff.capital (cBuy - fee)
       creditTradeFee dData mData fee
+      updatePremiumEwma mData qty execPrice markP oiSide fee
 
     if sBuy == SIDE_FLAT then
       storeU8  lpBuy LegOff.side targetSide

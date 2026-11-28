@@ -27,6 +27,11 @@ def MAX_STALENESS    : UInt64 := 9_000              -- maximum oracle staleness 
 def MAX_LEGS         : UInt64 := 8                  -- max cross-margin legs per Portfolio
 def MIN_FIRST_INS_DEPOSIT : UInt64 := 1_000_000     -- 1.0 quote unit min first LP deposit (anti-ERC4626 inflation)
 def RAMP_FRONT_COOLDOWN   : UInt64 := 2             -- pause new `I_m` fronting for 2 calm slots after a saturated oracle ramp step
+def SLOTS_PER_8H          : UInt64 := 72_000        -- 8 hours at 400ms/slot (HL/Binance funding normalization window)
+def PREM_ZERO             : UInt64 := 0x4000000000000000 -- 2^62 biased zero for signed E6 perp premium (100 = 1 bps = 0.01%)
+def MAX_FUND_8H_BPS       : UInt64 := 1_000         -- hard cap on maxFunding8hBps (±10% per 8h)
+def MAX_FUND_DEADBAND_E6  : UInt64 := 50_000        -- hard cap on deadbandE6 (±5%)
+def MAX_PREM_WEIGHT_E6    : UInt64 := 250_000       -- max 25% EWMA weight per single trade (anti-manipulation)
 
 /-! ### Pinned Canonical SPL Token Program ID (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`) -/
 
@@ -122,10 +127,10 @@ namespace DexOff
   def totalRewards    : UInt64 := 200 -- u64 (F_tot = Σ m.rewardAccrued; disjoint from C, I, R, S!)
 end DexOff
 
-/-! ### Exact Byte Offsets: `Market` (400 bytes — Per-Market Isolated Risk & Reward Domain) -/
+/-! ### Exact Byte Offsets: `Market` (416 bytes — Per-Market Isolated Risk, Funding & Reward Domain) -/
 
 namespace MktOff
-  def size            : UInt64 := 400
+  def size            : UInt64 := 416
   def magic          : UInt64 := 0   -- u32 ("MKTP")
   def status         : UInt64 := 4   -- u8
   -- byte 5: reserved zero padding (all markets are permissionless & cross-margin equal!)
@@ -168,6 +173,8 @@ namespace MktOff
   def rewardBps       : UInt64 := 352 -- u64 (0..10000 bps of tradeFee routed to this market's reward module; immutable!)
   def rewardAccrued   : UInt64 := 360 -- u64 (F_m: accrued quote collateral claimable ONLY by rewardRecipient!)
   def rewardRecipient : UInt64 := 368 -- Pubkey (32B immutable reward-module authority PDA; non-zero iff rewardBps > 0)
+  def fundingCfg      : UInt64 := 400 -- u64 (immutable packed: baseIntE6:u16 | deadbandE6:u16<<16 | maxFund8hBps:u16<<32 | decaySlots:u16<<48; 0=off)
+  def premiumEwma     : UInt64 := 408 -- u64 (biased by PREM_ZERO: signed E6 perp-vs-spot premium EWMA, 100 = 1 bps)
 end MktOff
 
 /-! ### Exact Byte Offsets: `Portfolio` (976 bytes = 144B header + 8 × 104B `Leg` slots) -/
@@ -218,7 +225,7 @@ end InsOff
 
 theorem layout_sizes_valid :
     DexOff.totalRewards + 8 ≤ DexOff.size ∧ DexOff.size % 8 == 0 ∧
-    MktOff.rewardRecipient + 32 ≤ MktOff.size ∧ MktOff.size % 8 == 0 ∧
+    MktOff.premiumEwma + 8 ≤ MktOff.size ∧ MktOff.size % 8 == 0 ∧
     PflOff.matcherCtx + 32 ≤ PflOff.headerSize ∧
     LegOff.lockedMm + 8 ≤ PflOff.legStride ∧
     PflOff.headerSize + MAX_LEGS * PflOff.legStride == PflOff.size ∧ PflOff.size % 8 == 0 ∧

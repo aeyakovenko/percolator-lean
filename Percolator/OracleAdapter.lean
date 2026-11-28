@@ -719,7 +719,9 @@ def handleCrank (input : Ptr) : SolanaM Unit := do
   -- Fast-snap when market has ZERO open/dead positions (`OI == 0 ∧ rawBasis == 0`),
   -- otherwise smooth slot-paced clamp (`dt == 1` half-step) + bounded premium funding!
   let rawMaxMove ← loadU64 mData MktOff.maxMoveBps
-  let fundBps    ← loadU64 aData AdpOff.fundingBpsPerStep
+  let mktFundCfg ← loadU64 mData MktOff.fundingCfg
+  let rawFundBps ← loadU64 aData AdpOff.fundingBpsPerStep
+  let fundBps    := if mktFundCfg != 0 then 0 else rawFundBps
   let (newP, fundSign, fundE6) ← computeCrankStep oldP feedPrice rawMaxMove fundBps curSlot lastSlot isEmpty
 
   -- CPI `percolator::UpdateOracle(mkt[W], oracAuthPda[S])`
