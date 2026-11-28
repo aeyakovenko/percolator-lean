@@ -17,13 +17,13 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 | Program | ELF `.so` Size (sBPF v3) | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,952 B** | 11,702 | 784 B | 0 B | **247 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs`/`Layout` |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,952 B** | 11,702 | 784 B | 0 B | **251 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs`/`Layout` |
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** (CPI-Out PropAMM) | **6,200 B** | 733 | 64 B | 0 B | **7 theorems** (layout, ask/bid bounds, `maxMove` clamp, LP-favorable spread) |
 | **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (HL Orderbook) | **14,064 B** | 1,716 | 304 B | 0 B | **8 theorems** (`limit_book_layout_valid`, `limit_fill_conserves_remaining`, `oco_sync_cancels_partner`, `twap_slice_bounded`, `twapReadyU64_iff_exact_nat`, `alo_post_only_passive`, `stop_and_tp_trigger_sound`, `trailing_watermark_monotone`) |
 | **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Oracle Bridge) | **19,352 B** | 2,377 | 552 B | 0 B | **8 theorems** (clamp + funding bounds, OCR2 ring-buffer, E6 scaling, 2-leg ratio, EWMA bounds/fixed-point/refinement) |
 | **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (HLP Takeover Vault) | **17,384 B** | 2,131 | 864 B | 0 B | **6 public theorems** (7 incl. private; layout, anti-inflation lock, NAV non-dilution, withdrawal solvency, allowlist subset anti-rug) |
 | **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (Buy & Burn) | **20,584 B** | 2,531 | 704 B | 0 B | **11 public theorems** (12 incl. private; layout, $xy=k$ invariant, batch solvency, quiet-epoch cap, spam monotonicity, anti-collapse healthy/dust/empty rate proofs, exact fee-split conservation) |
-| *Total* | *6 production ELFs* | — | — | **0 B** | **287 public theorems** (337 incl. private lemmas), `0 sorry`, `0` custom axioms |
+| *Total* | *6 production ELFs* | — | — | **0 B** | **291 public theorems** (347 incl. private lemmas), `0 sorry`, `0` custom axioms |
 
 ---
 
@@ -162,7 +162,7 @@ Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **ne
 
 ## 6. Verification & Benchmarks (LiteSVM `0.18.2` / Agave `4.3.2`, sBPF v3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **287 public Lean 4 theorems** (`337` incl. private lemmas, `0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **26 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
+See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **291 public Lean 4 theorems** (`347` incl. private lemmas, `0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **26 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
 
 ### Worst-Case 8-Leg / 16-Leg CU & Legacy Wire-MTU Benchmarks (Suite 11)
 
@@ -215,7 +215,7 @@ See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **287 public Lean 4
 ## 7. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (287 public theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (291 public theorems, 0 sorry, 0 custom axioms),
 # compile all 7 sBPF v3 .so binaries, and execute all 17 LiteSVM suites:
 ./scripts/build-and-test.sh
 
