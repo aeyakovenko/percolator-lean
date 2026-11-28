@@ -2138,7 +2138,7 @@ pub fn test_18_mode4_netting_flip_and_adversarial_edge_cases(elf: &[u8]) {
 pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher_elf: &[u8]) {
     const SYSVAR_IX_ID: Address =
         Address::from_str_const("Sysvar1nstructions1111111111111111111111111");
-    const LIMIT_BOOK_SIZE: usize = 864;
+    const LIMIT_BOOK_SIZE: usize = 896;
     const ORD_LIMIT: u8         = 0;
     const ORD_STOP_LOSS: u8     = 1;
     const ORD_TAKE_PROFIT: u8   = 2;
@@ -2150,15 +2150,16 @@ pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher
     const FLAG_PRICE_IMPROVE: u8 = 8;
     const OCO_NONE: u8           = 0xFF;
 
-    let slot_off = |slot: usize| 224 + slot * 80;
+    let slot_off = |slot: usize| 256 + slot * 80;
 
-    let ix_init_book = |lm_prog: Address, ctx: Address, owner: Address, perc_prog: Address| {
+    let ix_init_book = |lm_prog: Address, ctx: Address, owner: Address, perc_prog: Address, dex: Address| {
         Instruction {
             program_id: lm_prog,
             accounts: vec![
                 AccountMeta::new(ctx, false),
                 AccountMeta::new_readonly(owner, true),
                 AccountMeta::new_readonly(perc_prog, false),
+                AccountMeta::new_readonly(dex, false),
             ],
             data: vec![0u8],
         }
@@ -2239,12 +2240,12 @@ pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher
     // Searcher starts with $0 deposited on the DEX — holds $400 USDC in wallet (flash borrow float + later mode tests)
     let searcher = e.create_trader(400 * POS_SCALE, 0);
 
-    // Initialize 864B 8-slot personal orderbooks for Alice & Bob and bind via SetPortfolioMatcher
+    // Initialize 896B 8-slot personal orderbooks for Alice & Bob (pinning `dex`!) and bind via SetPortfolioMatcher
     let alice_ctx = create_prog_acc(&mut e.svm, &lm_prog, LIMIT_BOOK_SIZE);
     let bob_ctx   = create_prog_acc(&mut e.svm, &lm_prog, LIMIT_BOOK_SIZE);
-    send_ok(&mut e.svm, ix_init_book(lm_prog, alice_ctx, alice.kp.pubkey(), e.prog_id), &e.payer, &[&e.payer, &alice.kp]);
+    send_ok(&mut e.svm, ix_init_book(lm_prog, alice_ctx, alice.kp.pubkey(), e.prog_id, e.dex), &e.payer, &[&e.payer, &alice.kp]);
     send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, alice.pfl, alice.kp.pubkey(), Some(alice_ctx)), &e.payer, &[&e.payer, &alice.kp]);
-    send_ok(&mut e.svm, ix_init_book(lm_prog, bob_ctx, bob.kp.pubkey(), e.prog_id), &e.payer, &[&e.payer, &bob.kp]);
+    send_ok(&mut e.svm, ix_init_book(lm_prog, bob_ctx, bob.kp.pubkey(), e.prog_id, e.dex), &e.payer, &[&e.payer, &bob.kp]);
     send_ok(&mut e.svm, ix_set_portfolio_matcher(e.prog_id, bob.pfl, bob.kp.pubkey(), Some(bob_ctx)), &e.payer, &[&e.payer, &bob.kp]);
 
     // Alice places Slot 0: GTC Limit Buy 2 BTC @ $100.50; Bob places Slot 0: GTC Limit Sell 2 BTC @ $99.75
@@ -2489,6 +2490,38 @@ pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher
     );
     // Pump BTC to $105.00 -> permissionless crank (payer signs, NOT Alice!) ratchets watermark $100 -> $105!
     e.update_oracle(btc, 105 * POS_SCALE, 0, 0);
+    // Security Regression (Cross-DEX Fake-Market Spoofing): Attacker creates a rogue `Dex_evil` under the
+    // SAME `percolatorProg` with fake `Market #1` (`marketId = 1`, `markPrice = $999`) and calls `CrankTrailing`.
+    // Must be REJECTED (`Custom(306)` `LErr.badMarket`) and leave Alice's watermark untouched!
+    let evil_admin = Keypair::new();
+    e.svm.airdrop(&evil_admin.pubkey(), 10_000_000_000).unwrap();
+    let evil_dex = create_prog_acc(&mut e.svm, &e.prog_id, DEX_SIZE);
+    let (evil_vault, evil_bump) = derive_dex_vault(&e.prog_id, &evil_dex);
+    let evil_fee = create_tok_acc(&mut e.svm, &e.mint, &evil_admin.pubkey(), 0);
+    send_ok(
+        &mut e.svm,
+        ix_init_dex(
+            e.prog_id, evil_dex, evil_admin.pubkey(), e.mint, evil_vault, evil_fee,
+            TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID, evil_bump, 6, 0, SPL_TOKEN_RENT_MIN,
+        ),
+        &e.payer, &[&e.payer, &evil_admin],
+    );
+    let evil_mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let evil_ctok = create_tok_acc(&mut e.svm, &e.mint, &evil_admin.pubkey(), 0);
+    send_ok(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, evil_dex, evil_mkt, e.mint, evil_admin.pubkey(), evil_admin.pubkey(),
+            evil_ctok, evil_fee, 999 * POS_SCALE, 10, 50, 0, 1000, 500, 100, 5, 75, 2500, 1_000_000 * POS_SCALE,
+        ),
+        &e.payer, &[&e.payer, &evil_admin],
+    );
+    assert_eq!(read_u64(&e.svm, &evil_mkt, 8), btc_mid, "Evil market intentionally collides on marketId == 1!");
+    send_err_custom(
+        &mut e.svm, ix_crank_trailing(lm_prog, alice_ctx, evil_mkt, 4), &e.payer, &[&e.payer], 306,
+        "CrankTrailing MUST reject a fake market from another Dex even with identical marketId!",
+    );
+    assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(4) + 24), 100 * POS_SCALE, "Watermark untouched by spoofed Dex market!");
     send_ok(&mut e.svm, ix_crank_trailing(lm_prog, alice_ctx, btc, 4), &e.payer, &[&e.payer]);
     assert_eq!(read_u64(&e.svm, &alice_ctx, slot_off(4) + 24), 105 * POS_SCALE, "CrankTrailing ratcheted watermark to $105.00!");
     // Retrace to $104.00 (> $105 * 0.98 = $102.90): CrankTrailing MUST NOT lower watermark, and fill MUST NOT trigger!
@@ -2545,6 +2578,29 @@ pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher
     assert_eq!(find_leg(&e, alice.pfl, btc), (1, 2 * POS_SCALE), "TWAP filled slice 2 -> Long 2 BTC total");
     assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(5)), 0, "TWAP completed & deactivated");
 
+    // Security Regression (TWAP `u64` Wraparound Bypass): `intervalSlots = u64::MAX - curSlot + 5`
+    // would wrap `lastFillSlot + intervalSlots` below `curSlot` under naive `u64` addition!
+    // Wrap-free `twapReadyU64` MUST keep slice 2 blocked (`Custom(301)`)!
+    let wrap_interval = u64::MAX - e.slot + 5;
+    send_ok(
+        &mut e.svm,
+        ix_place_order(lm_prog, alice_ctx, alice.kp.pubkey(), 5, ORD_TWAP, false, 0, OCO_NONE, btc_mid, 0, POS_SCALE / 2, POS_SCALE, 0, wrap_interval),
+        &e.payer, &[&e.payer, &alice.kp],
+    );
+    send_ok(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE / 2, 0),
+        &e.payer, &[&e.payer, &searcher.kp],
+    );
+    e.advance_slot(10);
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_with_matcher(e.prog_id, e.dex, btc, searcher.pfl, searcher.kp.pubkey(), alice.pfl, lm_prog, alice_ctx, Some(SYSVAR_IX_ID), 4, true, POS_SCALE / 2, 0),
+        &e.payer, &[&e.payer, &searcher.kp], 301,
+        "TWAP u64-wrapping intervalSlots must NOT bypass cooldown!",
+    );
+    send_ok(&mut e.svm, ix_cancel_order(lm_prog, alice_ctx, alice.kp.pubkey(), 5), &e.payer, &[&e.payer, &alice.kp]);
+
     // Multi-Market Batch Fill (`k = 2`): refresh ETH oracle, place BTC Buy (Slot 6) + ETH Sell (Slot 7), fill BOTH in 1 CPI!
     e.update_oracle(eth, 100 * POS_SCALE, 0, 0);
     send_ok(
@@ -2567,7 +2623,7 @@ pub fn test_19_flash_arb_crossing_limit_order_matchers(elf: &[u8], limit_matcher
         ),
         &e.payer, &[&e.payer, &searcher.kp],
     );
-    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 3 * POS_SCALE), "Batch fill k=2 added BTC Long +1");
+    assert_eq!(find_leg(&e, alice.pfl, btc), (1, 5 * POS_SCALE / 2), "Batch fill k=2 added BTC Long +1 (1.5 -> 2.5)");
     assert_eq!(find_leg(&e, alice.pfl, eth), (2, 1 * POS_SCALE), "Batch fill k=2 opened ETH Short 1");
     assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(6)), 0);
     assert_eq!(read_u8(&e.svm, &alice_ctx, slot_off(7)), 0);
@@ -3195,6 +3251,15 @@ pub fn test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(
         "mode=2 hand-off at wide $82 spread MUST stay clamped (blocks margin-stripping!)",
     );
 
+    // Security Regression (`mode = 2` hand-off `qty > legCloseCap` rejected `Custom(103)`):
+    // Alice holds Long 1.0 (while market `oiLong = 2.0`), so requesting `qty = 2.0` MUST fail!
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, mkt, alice.pfl, alice.kp.pubkey(), shell.pfl, shell.kp.pubkey(), 2, 2 * POS_SCALE, 99 * POS_SCALE),
+        &e.payer, &[&e.payer, &alice.kp, &shell.kp], 103,
+        "mode=2 hand-off with qty > seller legCloseCap MUST be rejected!",
+    );
+
     // 2b. Voluntary bilateral close at real spot $82 via `mode = 4` (auto-routed to unclamped `mode = 1`!):
     //     Bob buys 1.0 from Alice at $82 while mark is still $99 (-17% spread = $17 paid by Alice to Bob)!
     let alice_pre = e.capital(&alice);
@@ -3215,13 +3280,14 @@ pub fn test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(
     //     Dave posts a Limit Buy @ $82 (closing his Short 1.0); Carol sells her Long 1.0 into it:
     //     - With `limitPrice = 0`: REJECTED `Custom(130)` (safety backstop when taker sets no limitPrice!)
     //     - With `limitPrice = $80`: SUCCEEDS at exact `$82.00`, taking market `OI -> 0`!
-    let dave_ctx = create_prog_acc(&mut e.svm, &lm_prog, 864);
+    let dave_ctx = create_prog_acc(&mut e.svm, &lm_prog, 896);
     send_ok(&mut e.svm, Instruction {
         program_id: lm_prog,
         accounts: vec![
             AccountMeta::new(dave_ctx, false),
             AccountMeta::new_readonly(dave.kp.pubkey(), true),
             AccountMeta::new_readonly(e.prog_id, false),
+            AccountMeta::new_readonly(e.dex, false),
         ],
         data: vec![0u8],
     }, &e.payer, &[&e.payer, &dave.kp]);
@@ -3257,6 +3323,34 @@ pub fn test_25_network_outage_reprice_exit_snap_and_zero_ins_drain(
     assert_eq!(read_u64(&e.svm, &mkt, 256), 0, "Market OI dropped cleanly to 0 via voluntary real-price exits!");
     assert_eq!(read_u64(&e.svm, &mkt, 264), 0);
     e.check("t25-after-voluntary-reprice-exits");
+
+    // Security Regression (`MAX_MKT_NOTIONAL` bypass after `OI == 0` 1-slot snap!):
+    // Create market at `initPrice = 1`, `maxOi = 10^13` (`initNot = 10^7 <= 10^17`), snap while `OI == 0`
+    // straight to `MAX_PRICE = 10^12`, then attempt `Trade(mode=0, qty = 2 * 10^11)` (`openNot = 2*10^17 > 10^17`).
+    // Must be REJECTED (`Custom(114)` `PErr.oiLimitExceeded`) so `UpdateOracle` can NEVER be bricked!
+    let snap_mkt = create_prog_acc(&mut e.svm, &e.prog_id, MKT_SIZE);
+    let snap_ctok = create_tok_acc(&mut e.svm, &e.mint, &e.admin.pubkey(), 0);
+    send_ok(
+        &mut e.svm,
+        ix_create_market(
+            e.prog_id, e.dex, snap_mkt, e.mint, e.oracle.pubkey(), e.admin.pubkey(),
+            snap_ctok, e.fee_vault, 1, 10, 50, 0, 1000, 500, 100, 5, 75, 2500, 10_000_000_000_000,
+        ),
+        &e.payer, &[&e.payer, &e.admin],
+    );
+    e.advance_slot(1);
+    send_ok(
+        &mut e.svm,
+        ix_update_oracle(e.prog_id, snap_mkt, e.oracle.pubkey(), 1_000_000_000_000, 0, 0),
+        &e.payer, &[&e.payer, &e.oracle],
+    );
+    assert_eq!(read_u64(&e.svm, &snap_mkt, 112), 1_000_000_000_000, "Empty market snapped to MAX_PRICE");
+    send_err_custom(
+        &mut e.svm,
+        ix_trade_ext(e.prog_id, e.dex, snap_mkt, alice.pfl, alice.kp.pubkey(), bob.pfl, bob.kp.pubkey(), 0, 200_000_000_000, 0),
+        &e.payer, &[&e.payer, &alice.kp, &bob.kp], 114,
+        "Trade(mode=0) exceeding MAX_MKT_NOTIONAL after OI=0 snap MUST reject with PErr.oiLimitExceeded (114)!",
+    );
 
     // =========================================================================
     // OUTAGE 3: INSTANT 1-SLOT ORACLE SNAP WHEN `OI == 0` + ASYNC CROSS-BACKING RESUMES!

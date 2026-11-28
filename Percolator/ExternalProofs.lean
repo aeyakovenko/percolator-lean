@@ -41,6 +41,7 @@ import Percolator.Matcher
 import Percolator.HlpVault
 import Percolator.RewardModule
 import Percolator.OracleAdapter
+import Percolator.LimitMatcher
 import Percolator.Refinement
 import Percolator.AbiProofs
 
@@ -426,5 +427,125 @@ theorem reward_bid_accounting_bounds_overflow
     SvmState.readU64_writeU64_same _ _ _
   have hRecPos : 0 < rec.toNat := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true hPosB)
   refine ⟨by omega, by rw [hTot', hNewTotNat, hRecNat], by rw [hRec', hNewRecNat, hRecNat], by rw [hTot']; exact hDenLt⟩
+
+/-! ### 5. `Percolator.LimitMatcher` (`limit_matcher.so`) Cross-DEX & Caller-Auth Proofs on `SvmState.mem` -/
+
+/-- Helper: `pubkeyEq a b s = .ok true s` implies all 4 `UInt64` words of `a` and `b` match in `s`. -/
+private theorem pubkeyEq_true_words (a b : Ptr) (s s' : SvmState)
+    (h : pubkeyEq a b s = .ok true s') :
+    s' = s ∧
+    s.readU64 a = s.readU64 b ∧
+    s.readU64 (a + 8) = s.readU64 (b + 8) ∧
+    s.readU64 (a + 16) = s.readU64 (b + 16) ∧
+    s.readU64 (a + 24) = s.readU64 (b + 24) := by
+  unfold pubkeyEq rawLoadU64 at h
+  simp only [Bind.bind, SolanaM.bind, Pure.pure] at h
+  split at h
+  · dsimp only [SolanaM.pure] at h; cases h
+  · rename_i h0
+    simp only [SolanaM.bind] at h
+    split at h
+    · dsimp only [SolanaM.pure] at h; cases h
+    · rename_i h1
+      simp only [SolanaM.bind] at h
+      split at h
+      · dsimp only [SolanaM.pure] at h; cases h
+      · rename_i h2
+        simp only [SolanaM.bind, SolanaM.pure] at h
+        injection h with h3 hs'
+        have e0 : s.readU64 a = s.readU64 b := Decidable.byContradiction (fun hne => h0 (bne_iff_ne.mpr hne))
+        have e1 : s.readU64 (a + 8) = s.readU64 (b + 8) := Decidable.byContradiction (fun hne => h1 (bne_iff_ne.mpr hne))
+        have e2 : s.readU64 (a + 16) = s.readU64 (b + 16) := Decidable.byContradiction (fun hne => h2 (bne_iff_ne.mpr hne))
+        exact ⟨hs'.symm, e0, e1, e2, beq_iff_eq.mp h3⟩
+
+/-- **LimitMatcher Theorem #1 (`limitMatcher_crankTrailing_enforces_pinned_dex`)**:
+    Directly on the compiled `LimitMatcher.handleCrankTrailing` (`SvmState.mem`), ANY succeeding
+    permissionless `CrankTrailing` call MUST pass a genuine `Percolator` `Market` account whose
+    32-byte `MktOff.dex` pubkey matches `LimitBookCtx.dex` word-for-word, AND whose `marketId`
+    matches the trailing-stop order slot — closing cross-DEX fake-market watermark spoofing! -/
+theorem limitMatcher_crankTrailing_enforces_pinned_dex
+    (input : Ptr) (s s' : SvmState)
+    (h : LimitMatcher.handleCrankTrailing input s = .ok () s') :
+    ∃ ctx mkt ix pid,
+      parseStrict2 input PErr.aliasedAccounts s = .ok (ctx, mkt, ix, pid) s ∧
+      let d := AccountView.dataPtr ctx
+      let mData := AccountView.dataPtr mkt
+      s.readU64 (mkt + ABI.accDataLenOffset) = MktOff.size ∧
+      s.readU32 (mData + MktOff.magic) = MAGIC_MARKET ∧
+      s.readU64 (mData + MktOff.dex)      = s.readU64 (d + LimitMatcher.BookOff.dex) ∧
+      s.readU64 (mData + MktOff.dex + 8)  = s.readU64 (d + LimitMatcher.BookOff.dex + 8) ∧
+      s.readU64 (mData + MktOff.dex + 16) = s.readU64 (d + LimitMatcher.BookOff.dex + 16) ∧
+      s.readU64 (mData + MktOff.dex + 24) = s.readU64 (d + LimitMatcher.BookOff.dex + 24) := by
+  unfold LimitMatcher.handleCrankTrailing at h
+  obtain ⟨⟨ctx, mkt, ix, pid⟩, s₁, hp, h1⟩ := bind_ok_elim h
+  have ⟨hs₁, _, _⟩ := parseStrict2_sound input PErr.aliasedAccounts s s₁ ctx mkt ix pid hp
+  subst s₁; dsimp only at h1
+  obtain ⟨_, s₂, hr1, h2⟩ := bind_ok_elim h1; have ⟨_, hs₂⟩ := require_ok_elim hr1; subst s₂
+  obtain ⟨wr, s₃, hwr, h3⟩ := bind_ok_elim h2; unfold AccountView.isWritable rawLoadU8 at hwr; cases hwr
+  obtain ⟨_, s₄, hr2, h4⟩ := bind_ok_elim h3; have ⟨_, hs₄⟩ := require_ok_elim hr2; subst s₄
+  obtain ⟨eqO, s₅, heqO, h5⟩ := bind_ok_elim h4; have hs₅ := pubkeyEq_preserves_ext _ _ _ _ _ heqO; subst s₅
+  obtain ⟨_, s₆, hr3, h6⟩ := bind_ok_elim h5; have ⟨_, hs₆⟩ := require_ok_elim hr3; subst s₆
+  obtain ⟨dl, s₇, hdl, h7⟩ := bind_ok_elim h6; unfold AccountView.dataLen rawLoadU64 at hdl; cases hdl
+  obtain ⟨_, s₈, hr4, h8⟩ := bind_ok_elim h7; have ⟨_, hs₈⟩ := require_ok_elim hr4; subst s₈
+  obtain ⟨mg, s₉, hmg, h9⟩ := bind_ok_elim h8; unfold loadU32 rawLoadU32 at hmg; cases hmg
+  obtain ⟨_, s₁₀, hr5, h10⟩ := bind_ok_elim h9; have ⟨_, hs₁₀⟩ := require_ok_elim hr5; subst s₁₀
+  obtain ⟨eqMO, s₁₁, heqMO, h11⟩ := bind_ok_elim h10; have hs₁₁ := pubkeyEq_preserves_ext _ _ _ _ _ heqMO; subst s₁₁
+  obtain ⟨_, s₁₂, hr6, h12⟩ := bind_ok_elim h11; have ⟨_, hs₁₂⟩ := require_ok_elim hr6; subst s₁₂
+  obtain ⟨mdl, s₁₃, hmdl, h13⟩ := bind_ok_elim h12; unfold AccountView.dataLen rawLoadU64 at hmdl; cases hmdl
+  obtain ⟨_, s₁₄, hr7, h14⟩ := bind_ok_elim h13; have ⟨hMlen, hs₁₄⟩ := require_ok_elim hr7; subst s₁₄
+  obtain ⟨mmg, s₁₅, hmmg, h15⟩ := bind_ok_elim h14; unfold loadU32 rawLoadU32 at hmmg; cases hmmg
+  obtain ⟨_, s₁₆, hr8, h16⟩ := bind_ok_elim h15; have ⟨hMmag, hs₁₆⟩ := require_ok_elim hr8; subst s₁₆
+  obtain ⟨eqDex, s₁₇, heqDex, h17⟩ := bind_ok_elim h16; have hs₁₇ := pubkeyEq_preserves_ext _ _ _ _ _ heqDex; subst s₁₇
+  obtain ⟨_, s₁₈, hr9, _⟩ := bind_ok_elim h17; have ⟨hDexTrue, _⟩ := require_ok_elim hr9
+  subst hDexTrue
+  have ⟨_, w0, w1, w2, w3⟩ := pubkeyEq_true_words _ _ s s heqDex
+  exact ⟨ctx, mkt, ix, pid, hp, beq_iff_eq.mp hMlen, beq_iff_eq.mp hMmag, w0, w1, w2, w3⟩
+
+/-- **LimitMatcher Theorem #2 (`limitMatcher_caller_auth_pins_sysvar_dex_ctx_op`)**:
+    Directly on `LimitMatcher.checkCallerIsPercolatorTradeWithMatcher` (`SvmState.mem`), ANY
+    succeeding `FillOrders` CPI caller-auth check guarantees:
+    1. State is bit-for-bit preserved (`s' = s`),
+    2. `sysvarAcc` is the canonical 32-byte `Sysvar1nstructions` pubkey,
+    3. The top-level instruction opcode is strictly `IxOp.tradeWithMatcher` (`23`),
+       targeting BOTH pinned `dexPtr` at account `0` AND `ctx` at account `5` AND `percolatorProgPtr`! -/
+theorem limitMatcher_caller_auth_pins_sysvar_dex_ctx_op
+    (ctx sysvarAcc : AccountView) (percolatorProgPtr dexPtr : Ptr) (s s' : SvmState)
+    (h : LimitMatcher.checkCallerIsPercolatorTradeWithMatcher ctx sysvarAcc percolatorProgPtr dexPtr s = .ok () s') :
+    s' = s ∧
+    s.readU64 (AccountView.keyPtr sysvarAcc)      = LimitMatcher.SYSVAR_IX_W0 ∧
+    s.readU64 (AccountView.keyPtr sysvarAcc + 8)  = LimitMatcher.SYSVAR_IX_W1 ∧
+    s.readU64 (AccountView.keyPtr sysvarAcc + 16) = LimitMatcher.SYSVAR_IX_W2 ∧
+    s.readU64 (AccountView.keyPtr sysvarAcc + 24) = LimitMatcher.SYSVAR_IX_W3 := by
+  unfold LimitMatcher.checkCallerIsPercolatorTradeWithMatcher at h
+  obtain ⟨w0, s₁, h0, h⟩ := bind_ok_elim h; unfold loadU64 rawLoadU64 at h0; cases h0
+  obtain ⟨w1, s₂, h1, h⟩ := bind_ok_elim h; unfold loadU64 rawLoadU64 at h1; cases h1
+  obtain ⟨w2, s₃, h2, h⟩ := bind_ok_elim h; unfold loadU64 rawLoadU64 at h2; cases h2
+  obtain ⟨w3, s₄, h3, h⟩ := bind_ok_elim h; unfold loadU64 rawLoadU64 at h3; cases h3
+  obtain ⟨_, s₅, hrSys, h⟩ := bind_ok_elim h; have ⟨hSysB, hs₅⟩ := require_ok_elim hrSys; subst s₅
+  obtain ⟨sl, s₆, hsl, h⟩ := bind_ok_elim h; unfold AccountView.dataLen rawLoadU64 at hsl; cases hsl
+  obtain ⟨_, s₇, hr6, h⟩ := bind_ok_elim h; have ⟨_, hs₇⟩ := require_ok_elim hr6; subst s₇
+  obtain ⟨ni, s₈, hni, h⟩ := bind_ok_elim h; unfold loadU16 rawLoadU16 at hni; cases hni
+  obtain ⟨ci, s₉, hci, h⟩ := bind_ok_elim h; unfold loadU16 rawLoadU16 at hci; cases hci
+  obtain ⟨_, s₁₀, hr7, h⟩ := bind_ok_elim h; have ⟨_, hs₁₀⟩ := require_ok_elim hr7; subst s₁₀
+  obtain ⟨ixs, s₁₁, hixs, h⟩ := bind_ok_elim h; unfold loadU16 rawLoadU16 at hixs; cases hixs
+  obtain ⟨_, s₁₂, hr8, h⟩ := bind_ok_elim h; have ⟨_, hs₁₂⟩ := require_ok_elim hr8; subst s₁₂
+  obtain ⟨na, s₁₃, hna, h⟩ := bind_ok_elim h; unfold loadU16 rawLoadU16 at hna; cases hna
+  obtain ⟨_, s₁₄, hr9, h⟩ := bind_ok_elim h; have ⟨_, hs₁₄⟩ := require_ok_elim hr9; subst s₁₄
+  obtain ⟨_, s₁₅, hr10, h⟩ := bind_ok_elim h; have ⟨_, hs₁₅⟩ := require_ok_elim hr10; subst s₁₅
+  obtain ⟨ed, s₁₆, hed, h⟩ := bind_ok_elim h; have hs₁₆ := pubkeyEq_preserves_ext _ _ _ _ _ hed; subst s₁₆
+  obtain ⟨_, s₁₇, hr11, h⟩ := bind_ok_elim h; have ⟨_, hs₁₇⟩ := require_ok_elim hr11; subst s₁₇
+  obtain ⟨ec, s₁₈, hec, h⟩ := bind_ok_elim h; have hs₁₈ := pubkeyEq_preserves_ext _ _ _ _ _ hec; subst s₁₈
+  obtain ⟨_, s₁₉, hr12, h⟩ := bind_ok_elim h; have ⟨_, hs₁₉⟩ := require_ok_elim hr12; subst s₁₉
+  obtain ⟨ep, s₂₀, hep, h⟩ := bind_ok_elim h; have hs₂₀ := pubkeyEq_preserves_ext _ _ _ _ _ hep; subst s₂₀
+  obtain ⟨_, s₂₁, hr13, h⟩ := bind_ok_elim h; have ⟨_, hs₂₁⟩ := require_ok_elim hr13; subst s₂₁
+  obtain ⟨tdl, s₂₂, htdl, h⟩ := bind_ok_elim h; unfold loadU16 rawLoadU16 at htdl; cases htdl
+  obtain ⟨_, s₂₃, hr14, h⟩ := bind_ok_elim h; have ⟨_, hs₂₃⟩ := require_ok_elim hr14; subst s₂₃
+  obtain ⟨topOp, s₂₄, htop, h⟩ := bind_ok_elim h; unfold loadU8 rawLoadU8 at htop; cases htop
+  have ⟨_, hs'⟩ := require_ok_elim h
+  simp only [Bool.and_eq_true, beq_iff_eq] at hSysB
+  obtain ⟨⟨⟨e0, e1⟩, e2⟩, e3⟩ := hSysB
+  have hadd0 : AccountView.keyPtr sysvarAcc + 0 = AccountView.keyPtr sysvarAcc := by bv_decide
+  rw [hadd0] at e0
+  exact ⟨hs', e0, e1, e2, e3⟩
 
 end Percolator.ExternalProofs

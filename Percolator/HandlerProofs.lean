@@ -1086,4 +1086,298 @@ theorem handleTrade_preconditions_and_non_aliasing
   exact ⟨dex, mkt, pflL, ownerL, pflS, ownerSRaw, ownerS, ix, pid,
     hp, hres, m0, m1, m2, m3, m4, m5, of_decide_eq_true hlenB, hdL, hmL, hlL, hsL, hdM, hmM, hlM, hsM⟩
 
+/-- **Whole-Handler Theorem #7 (`handleCreateMarket_params_no_u64_wraparound`)**:
+    Directly on the compiled `Program.handleCreateMarket` (`SvmState.mem`, ZERO copy-paste!):
+    ANY succeeding `CreateMarket` enforces in **exact `Nat` arithmetic** (zero `UInt64` wraparound!):
+    - `liqFeeBps ≤ mmBps < imBps ≤ 10_000` and `maxMoveBps ≤ 1_500` (closes PR #10!),
+    - Exact `K+1 = 5` compounded solvency envelope `k5MoveBps_nat + liqAtP5_nat ≤ mmBps`
+      AND `mmBps + maxMoveBps ≤ imBps`,
+    - `0 < initPrice ≤ MAX_PRICE` and `maxFrontBps ≤ maxInsDrawBps ≤ 10_000`! -/
+theorem handleCreateMarket_params_no_u64_wraparound
+    (input : Ptr) (s s' : SvmState)
+    (h : Program.handleCreateMarket input s = .ok () s') :
+    ∃ dex mkt mint oracleAuth creatorRaw creatorTok feeVaultTokRaw tokProg ix pid,
+      parse8 input s = .ok (dex, mkt, mint, oracleAuth, creatorRaw, creatorTok, feeVaultTokRaw, tokProg, ix, pid) s ∧
+      let imBps      := (s.readU64 (ix.ptr + 36)).toNat
+      let mmBps      := (s.readU64 (ix.ptr + 44)).toNat
+      let liqFeeBps  := (s.readU64 (ix.ptr + 52)).toNat
+      let maxMoveBps := (s.readU64 (ix.ptr + 68)).toNat
+      let k5         := 5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000
+      let liqAtP5    := liqFeeBps + (liqFeeBps * k5 + 9999) / 10000
+      0 < mmBps ∧ mmBps < imBps ∧ imBps ≤ 10_000 ∧
+      liqFeeBps ≤ mmBps ∧ maxMoveBps ≤ 1_500 ∧
+      k5 + liqAtP5 ≤ mmBps ∧ mmBps + maxMoveBps ≤ imBps := by
+  unfold Program.handleCreateMarket at h
+  obtain ⟨⟨dex, mkt, mint, oracleAuth, creatorRaw, creatorTok, feeVaultTokRaw, tokProg, ix, pid⟩, s₁, hp, h1⟩ := bind_ok_elim h
+  have hs₁ : s₁ = s := by
+    unfold parse8 Input.numAccounts rawLoadU64 SolanaM.require at hp
+    dsimp only [Bind.bind, SolanaM.bind, Pure.pure, SolanaM.pure, SolanaM.fail] at hp
+    by_cases hn : s.readU64 input ≥ 8
+    · simp only [hn, decide_true, ↓reduceIte, SolanaM.pure, AccountView.nextCursor_exact] at hp
+      cases hsk : Input.skipAccounts _ _ s with
+      | err _ _ => rw [hsk] at hp; cases hp
+      | ok _ s2 => rw [hsk] at hp; cases hp; exact Input.skipAccounts_preserves_state _ _ _ _ _ hsk
+    · simp [hn, SolanaM.fail] at hp
+  subst s₁; dsimp only at h1
+  obtain ⟨_, s₂, hm0, h2⟩ := bind_ok_elim h1; have ⟨_, hs₂⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm0; subst s₂
+  obtain ⟨_, s₃, hm1, h3⟩ := bind_ok_elim h2; have ⟨_, hs₃⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm1; subst s₃
+  obtain ⟨_, s₄, hm2, h4⟩ := bind_ok_elim h3; have ⟨_, hs₄⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm2; subst s₄
+  obtain ⟨_, s₅, hm3, h5⟩ := bind_ok_elim h4; have ⟨_, hs₅⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm3; subst s₅
+  obtain ⟨creator, s₆, hres1, h6⟩ := bind_ok_elim h5
+  have hs₆ : s₆ = s := by
+    unfold AccountView.resolveDup rawLoadU8 SolanaM.require at hres1
+    dsimp only [Bind.bind, SolanaM.bind, Pure.pure, SolanaM.pure, SolanaM.fail] at hres1
+    split at hres1
+    · cases hres1; rfl
+    · split at hres1 <;> cases hres1; rfl
+  subst s₆
+  obtain ⟨_, s₇, hm5, h7⟩ := bind_ok_elim h6; have ⟨_, hs₇⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm5; subst s₇
+  obtain ⟨feeVaultTok, s₈, hres2, h8⟩ := bind_ok_elim h7
+  have hs₈ : s₈ = s := by
+    unfold AccountView.resolveDup rawLoadU8 SolanaM.require at hres2
+    dsimp only [Bind.bind, SolanaM.bind, Pure.pure, SolanaM.pure, SolanaM.fail] at hres2
+    split at hres2
+    · cases hres2; rfl
+    · split at hres2 <;> cases hres2; rfl
+  subst s₈
+  obtain ⟨_, s₉, hm7, h9⟩ := bind_ok_elim h8; have ⟨_, hs₉⟩ := (prog_requireNonDup_ok_iff _ _ _).mp hm7; subst s₉
+  obtain ⟨_, s₁₀, hlen, h10⟩ := bind_ok_elim h9; have ⟨_, hs₁₀⟩ := require_ok_elim hlen; subst s₁₀
+  obtain ⟨_, s₁₁, hsg, h11⟩ := bind_ok_elim h10; have hs₁₁ := requireSigner_preserves _ _ _ hsg; subst s₁₁
+  obtain ⟨_, s₁₂, hwr, h12⟩ := bind_ok_elim h11; have hs₁₂ := requireWritable_preserves _ _ _ hwr; subst s₁₂
+  obtain ⟨_, s₁₃, hcm, h13⟩ := bind_ok_elim h12; have ⟨hs₁₃, _, _⟩ := checkOwnedMagic_preserves _ _ _ _ _ _ hcm; subst s₁₃
+  obtain ⟨_, s₁₄, hcf, h14⟩ := bind_ok_elim h13
+  have hs₁₄ : s₁₄ = s := by
+    unfold checkFreshAccount at hcf
+    obtain ⟨_, a1, ha1, hcf⟩ := bind_ok_elim hcf; have := requireWritable_preserves _ _ _ ha1; subst a1
+    obtain ⟨_, a2, ha2, hcf⟩ := bind_ok_elim hcf; have := requireKeyEq_preserves _ _ _ _ _ ha2; subst a2
+    obtain ⟨_, a3, ha3, hcf⟩ := bind_ok_elim hcf; unfold AccountView.dataLen rawLoadU64 at ha3; cases ha3
+    obtain ⟨_, a4, ha4, hcf⟩ := bind_ok_elim hcf; have ⟨_, h⟩ := require_ok_elim ha4; subst a4
+    obtain ⟨_, a5, ha5, hcf⟩ := bind_ok_elim hcf; unfold loadU32 rawLoadU32 at ha5; cases ha5
+    exact (require_ok_elim hcf).2
+  subst s₁₄
+  obtain ⟨_, s₁₅, htp, h15⟩ := bind_ok_elim h14; have ⟨hs₁₅, _⟩ := checkTokenProg_sound _ _ _ htp; subst s₁₅
+  obtain ⟨_, s₁₆, hkm, h16⟩ := bind_ok_elim h15; have hs₁₆ := requireKeyEq_preserves _ _ _ _ _ hkm; subst s₁₆
+  obtain ⟨_, s₁₇, hl0, h17⟩ := bind_ok_elim h16; unfold loadU16 rawLoadU16 at hl0; cases hl0
+  obtain ⟨_, s₁₈, hl1, h18⟩ := bind_ok_elim h17; unfold loadU64 rawLoadU64 at hl1; cases hl1
+  obtain ⟨_, s₁₉, hl2, h19⟩ := bind_ok_elim h18; unfold loadU64 rawLoadU64 at hl2; cases hl2
+  obtain ⟨_, s₂₀, hl3, h20⟩ := bind_ok_elim h19; unfold loadU64 rawLoadU64 at hl3; cases hl3
+  obtain ⟨_, s₂₁, hl4, h21⟩ := bind_ok_elim h20; unfold loadU64 rawLoadU64 at hl4; cases hl4
+  obtain ⟨imBps, s₂₂, hl5, h22⟩ := bind_ok_elim h21; unfold loadU64 rawLoadU64 at hl5; cases hl5
+  obtain ⟨mmBps, s₂₃, hl6, h23⟩ := bind_ok_elim h22; unfold loadU64 rawLoadU64 at hl6; cases hl6
+  obtain ⟨liqFeeBps, s₂₄, hl7, h24⟩ := bind_ok_elim h23; unfold loadU64 rawLoadU64 at hl7; cases hl7
+  obtain ⟨_, s₂₅, hl8, h25⟩ := bind_ok_elim h24; unfold loadU64 rawLoadU64 at hl8; cases hl8
+  obtain ⟨maxMoveBps, s₂₆, hl9, h26⟩ := bind_ok_elim h25; unfold loadU64 rawLoadU64 at hl9; cases hl9
+  obtain ⟨_, s₂₇, hl10, h27⟩ := bind_ok_elim h26; unfold loadU64 rawLoadU64 at hl10; cases hl10
+  obtain ⟨_, s₂₈, hl11, h28⟩ := bind_ok_elim h27; unfold loadU64 rawLoadU64 at hl11; cases hl11
+  obtain ⟨_, s₂₉, hl12, h29⟩ := bind_ok_elim h28
+  have hs₂₉ : s₂₉ = s := by
+    unfold loadOptU64 at hl12; split at hl12
+    · unfold loadU64 rawLoadU64 at hl12; cases hl12; rfl
+    · dsimp only [Pure.pure, SolanaM.pure] at hl12; cases hl12; rfl
+  subst s₂₉
+  obtain ⟨_, s₃₀, hl13, h30⟩ := bind_ok_elim h29
+  have hs₃₀ : s₃₀ = s := by
+    unfold loadOptRewardBps at hl13; split at hl13
+    · unfold loadU64 rawLoadU64 at hl13; cases hl13; rfl
+    · dsimp only [Pure.pure, SolanaM.pure] at hl13; cases hl13; rfl
+  subst s₃₀
+  obtain ⟨_, s₃₁, hr1, h31⟩ := bind_ok_elim h30; have ⟨_, hs₃₁⟩ := require_ok_elim hr1; subst s₃₁
+  obtain ⟨_, s₃₂, hr2, h32⟩ := bind_ok_elim h31; have ⟨_, hs₃₂⟩ := require_ok_elim hr2; subst s₃₂
+  let imBps := s.readU64 (ix.ptr + 36)
+  let mmBps := s.readU64 (ix.ptr + 44)
+  let liqFeeBps := s.readU64 (ix.ptr + 52)
+  let maxMoveBps := s.readU64 (ix.ptr + 68)
+  have hFinish : ∀ (sumK5 sumIm : UInt64),
+      (decide (mmBps > 0) && decide (mmBps < imBps) && decide (imBps ≤ BPS_DEN)) = true →
+      (decide (liqFeeBps ≤ mmBps) && decide (maxMoveBps ≤ 1500)) = true →
+      sumK5.toNat = (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000).toNat +
+        (liqFeeBps + (liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000) + 9999) / 10000).toNat →
+      sumIm.toNat = mmBps.toNat + maxMoveBps.toNat →
+      (decide (sumK5 ≤ mmBps) && decide (sumIm ≤ imBps)) = true →
+      0 < mmBps.toNat ∧ mmBps.toNat < imBps.toNat ∧ imBps.toNat ≤ 10_000 ∧
+      liqFeeBps.toNat ≤ mmBps.toNat ∧ maxMoveBps.toNat ≤ 1_500 ∧
+      (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) +
+        (liqFeeBps.toNat + (liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999) / 10000) ≤ mmBps.toNat ∧
+      mmBps.toNat + maxMoveBps.toNat ≤ imBps.toNat := by
+    intro sumK5 sumIm hMmB hLmB hSumK5Nat hSumImNat hEnvB
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hMmB hLmB hEnvB
+    obtain ⟨⟨hMmPos, hMmLtIm⟩, hImLe⟩ := hMmB
+    obtain ⟨hLiqLeMm, hMoveLe⟩ := hLmB
+    obtain ⟨hK5LeMm, hImBound⟩ := hEnvB
+    have hMmPosN : 0 < mmBps.toNat := UInt64.lt_iff_toNat_lt.mp hMmPos
+    have hMmLtImN : mmBps.toNat < imBps.toNat := UInt64.lt_iff_toNat_lt.mp hMmLtIm
+    have hImLeN : imBps.toNat ≤ 10_000 := UInt64.le_iff_toNat_le.mp hImLe
+    have hLiqLeMmN : liqFeeBps.toNat ≤ mmBps.toNat := UInt64.le_iff_toNat_le.mp hLiqLeMm
+    have hMoveLeN : maxMoveBps.toNat ≤ 1_500 := UInt64.le_iff_toNat_le.mp hMoveLe
+    have hK5LeMmN : sumK5.toNat ≤ mmBps.toNat := UInt64.le_iff_toNat_le.mp hK5LeMm
+    have hImBoundN : sumIm.toNat ≤ imBps.toNat := UInt64.le_iff_toNat_le.mp hImBound
+    have hm2 : maxMoveBps.toNat * maxMoveBps.toNat ≤ 1500 * 1500 := Nat.mul_le_mul hMoveLeN hMoveLeN
+    have h5m : (5 * maxMoveBps).toNat = 5 * maxMoveBps.toNat := by
+      rw [UInt64.toNat_mul]; change (5 * maxMoveBps.toNat) % 2 ^ 64 = _; exact Nat.mod_eq_of_lt (by omega)
+    have hmm : (maxMoveBps * maxMoveBps).toNat = maxMoveBps.toNat * maxMoveBps.toNat := by
+      rw [UInt64.toNat_mul, Nat.mod_eq_of_lt (by omega)]
+    have hmm12 : (maxMoveBps * maxMoveBps * 12).toNat = maxMoveBps.toNat * maxMoveBps.toNat * 12 := by
+      rw [UInt64.toNat_mul, hmm]; change (maxMoveBps.toNat * maxMoveBps.toNat * 12) % 2 ^ 64 = _
+      exact Nat.mod_eq_of_lt (by omega)
+    have hnum1 : (maxMoveBps * maxMoveBps * 12 + 9999).toNat = maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999 := by
+      rw [UInt64.toNat_add, hmm12]; change (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) % 2 ^ 64 = _
+      exact Nat.mod_eq_of_lt (by omega)
+    have hq1 : ((maxMoveBps * maxMoveBps * 12 + 9999) / 10000).toNat =
+        (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000 := by
+      rw [UInt64.toNat_div, hnum1]; rfl
+    have hk5Eq : (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000).toNat =
+        5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000 := by
+      rw [UInt64.toNat_add, h5m, hq1, Nat.mod_eq_of_lt (by omega)]
+    have hk5Le : 5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000 ≤ 10200 := by omega
+    have hProdLe : liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) ≤
+        10000 * 10200 := Nat.mul_le_mul (by omega) hk5Le
+    have hlk : (liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000)).toNat =
+        liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) := by
+      rw [UInt64.toNat_mul, hk5Eq, Nat.mod_eq_of_lt (by omega)]
+    have hnum2 : (liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000) + 9999).toNat =
+        liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999 := by
+      rw [UInt64.toNat_add, hlk]
+      change (liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999) % 2 ^ 64 = _
+      exact Nat.mod_eq_of_lt (by omega)
+    have hq2 : ((liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000) + 9999) / 10000).toNat =
+        (liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999) / 10000 := by
+      rw [UInt64.toNat_div, hnum2]; rfl
+    have hliqEq : (liqFeeBps + (liqFeeBps * (5 * maxMoveBps + (maxMoveBps * maxMoveBps * 12 + 9999) / 10000) + 9999) / 10000).toNat =
+        liqFeeBps.toNat + (liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999) / 10000 := by
+      rw [UInt64.toNat_add, hq2, Nat.mod_eq_of_lt (by omega)]
+    exact ⟨hMmPosN, hMmLtImN, hImLeN, hLiqLeMmN, hMoveLeN, by rw [hk5Eq, hliqEq] at hSumK5Nat; omega, by omega⟩
+  have hRes :
+      0 < mmBps.toNat ∧ mmBps.toNat < imBps.toNat ∧ imBps.toNat ≤ 10_000 ∧
+      liqFeeBps.toNat ≤ mmBps.toNat ∧ maxMoveBps.toNat ≤ 1_500 ∧
+      (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) +
+        (liqFeeBps.toNat + (liqFeeBps.toNat * (5 * maxMoveBps.toNat + (maxMoveBps.toNat * maxMoveBps.toNat * 12 + 9999) / 10000) + 9999) / 10000) ≤ mmBps.toNat ∧
+      mmBps.toNat + maxMoveBps.toNat ≤ imBps.toNat := by
+    split at h32
+    · obtain ⟨_, c1, hc1, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hc1; subst c1
+      obtain ⟨_, c2, hc2, h32⟩ := bind_ok_elim h32; have := pubkeyIsZero_preserves _ _ _ _ hc2; subst c2
+      obtain ⟨_, c3, hc3, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hc3; subst c3
+      obtain ⟨_, b4, hb4, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hb4; subst b4
+      obtain ⟨_, b5, hb5, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hb5; subst b5
+      obtain ⟨_, b6, hb6, h32⟩ := bind_ok_elim h32; have ⟨hMmB, h⟩ := require_ok_elim hb6; subst b6
+      obtain ⟨_, b7, hb7, h32⟩ := bind_ok_elim h32; have ⟨hLmB, h⟩ := require_ok_elim hb7; subst b7
+      obtain ⟨sK5, b8, hb8, h32⟩ := bind_ok_elim h32; have ⟨_, _, hSK5, h⟩ := checkedAdd64_ok_spec _ _ _ _ _ hb8; subst b8
+      obtain ⟨sIm, b9, hb9, h32⟩ := bind_ok_elim h32; have ⟨_, _, hSIm, h⟩ := checkedAdd64_ok_spec _ _ _ _ _ hb9; subst b9
+      obtain ⟨_, _, hb10, _⟩ := bind_ok_elim h32; have ⟨hEnvB, _⟩ := require_ok_elim hb10
+      exact hFinish sK5 sIm hMmB hLmB hSK5 hSIm hEnvB
+    · obtain ⟨_, b4, hb4, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hb4; subst b4
+      obtain ⟨_, b5, hb5, h32⟩ := bind_ok_elim h32; have ⟨_, h⟩ := require_ok_elim hb5; subst b5
+      obtain ⟨_, b6, hb6, h32⟩ := bind_ok_elim h32; have ⟨hMmB, h⟩ := require_ok_elim hb6; subst b6
+      obtain ⟨_, b7, hb7, h32⟩ := bind_ok_elim h32; have ⟨hLmB, h⟩ := require_ok_elim hb7; subst b7
+      obtain ⟨sK5, b8, hb8, h32⟩ := bind_ok_elim h32; have ⟨_, _, hSK5, h⟩ := checkedAdd64_ok_spec _ _ _ _ _ hb8; subst b8
+      obtain ⟨sIm, b9, hb9, h32⟩ := bind_ok_elim h32; have ⟨_, _, hSIm, h⟩ := checkedAdd64_ok_spec _ _ _ _ _ hb9; subst b9
+      obtain ⟨_, _, hb10, _⟩ := bind_ok_elim h32; have ⟨hEnvB, _⟩ := require_ok_elim hb10
+      exact hFinish sK5 sIm hMmB hLmB hSK5 hSIm hEnvB
+  exact ⟨dex, mkt, mint, oracleAuth, creatorRaw, creatorTok, feeVaultTokRaw, tokProg, ix, pid, hp, hRes⟩
+
+/-- **Whole-Handler Theorem #8 (`handleUpdateOracle_pacing_snap_and_notional`)**:
+    Directly on the compiled `Program.handleUpdateOracle` (`SvmState.mem`, ZERO copy-paste!):
+    ANY succeeding `UpdateOracle` call enforces:
+    1. Strictly 1 oracle update per slot (`curSlot > lastOracleSlot`),
+    2. `0 < newPrice ≤ MAX_PRICE`,
+    3. Empty market (`oiL = oiS = rL = rS = 0`) requires `fundE6 = 0` (enabling 1-slot instant snap!),
+    4. Loaded market enforces `dt == 1` half-step pacing (`effMaxMove = if curSlot == lastSlot + 1 ∧ rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove`)
+       and exact `|newPrice - oldPrice| + fundE6 ≤ ⌊oldPrice * effMaxMove / 10_000⌋`! -/
+theorem handleUpdateOracle_pacing_snap_and_notional
+    (input : Ptr) (s s' : SvmState)
+    (hsp : 64 ≤ s.stackSp.toNat)
+    (h : Program.handleUpdateOracle input s = .ok () s') :
+    ∃ mkt oracleAuth ix pid curSlot sClk,
+      parseStrict2 input PErr.aliasedAccounts s = .ok (mkt, oracleAuth, ix, pid) s ∧
+      getClockSlot s = .ok curSlot sClk ∧
+      let mData      := AccountView.dataPtr mkt
+      let lastSlot   := sClk.readU64 (mData + MktOff.lastOracleSlot)
+      let newPrice   := sClk.readU64 (ix.ptr + 1)
+      let fundE6     := sClk.readU64 (ix.ptr + 10)
+      let oldPrice   := sClk.readU64 (mData + MktOff.markPrice)
+      let rawMaxMove := sClk.readU64 (mData + MktOff.maxMoveBps)
+      let oiL        := sClk.readU64 (mData + MktOff.oiLong)
+      let oiS        := sClk.readU64 (mData + MktOff.oiShort)
+      let rL         := sClk.readU64 (mData + MktOff.rawBasisLong)
+      let rS         := sClk.readU64 (mData + MktOff.rawBasisShort)
+      let isEmpty    := oiL = 0 ∧ oiS = 0 ∧ rL = 0 ∧ rS = 0
+      let effMaxMove := if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+      let diff       := if newPrice.toNat ≥ oldPrice.toNat then newPrice.toNat - oldPrice.toNat else oldPrice.toNat - newPrice.toNat
+      lastSlot.toNat < curSlot.toNat ∧
+      0 < newPrice.toNat ∧ newPrice.toNat ≤ MAX_PRICE.toNat ∧
+      (isEmpty → fundE6 = 0) ∧
+      (¬isEmpty → diff + fundE6.toNat ≤ (oldPrice.toNat * effMaxMove.toNat) / 10_000) := by
+  unfold Program.handleUpdateOracle at h
+  obtain ⟨⟨mkt, oracleAuth, ix, pid⟩, s₁, hp, h1⟩ := bind_ok_elim h
+  have ⟨hs₁, _, _⟩ := parseStrict2_sound input PErr.aliasedAccounts s s₁ mkt oracleAuth ix pid hp
+  subst s₁; dsimp only at h1
+  obtain ⟨_, s₂, hlen, h2⟩ := bind_ok_elim h1; have ⟨_, hs₂⟩ := require_ok_elim hlen; subst s₂
+  obtain ⟨_, s₃, hsg, h3⟩ := bind_ok_elim h2; have hs₃ := requireSigner_preserves _ _ _ hsg; subst s₃
+  obtain ⟨_, s₄, hwr, h4⟩ := bind_ok_elim h3; have hs₄ := requireWritable_preserves _ _ _ hwr; subst s₄
+  obtain ⟨_, s₅, hcm, h5⟩ := bind_ok_elim h4; have ⟨hs₅, _, _⟩ := checkOwnedMagic_preserves _ _ _ _ _ _ hcm; subst s₅
+  obtain ⟨st, s₆, hst, h6⟩ := bind_ok_elim h5; unfold loadU8 rawLoadU8 at hst; cases hst
+  obtain ⟨_, s₇, hrst, h7⟩ := bind_ok_elim h6; have ⟨_, hs₇⟩ := require_ok_elim hrst; subst s₇
+  obtain ⟨_, s₈, hko, h8⟩ := bind_ok_elim h7; have hs₈ := requireKeyEq_preserves _ _ _ _ _ hko; subst s₈
+  obtain ⟨curSlot, sClk, hclk, h9⟩ := bind_ok_elim h8
+  have ⟨_, hspClkLo, _⟩ := getClockSlot_preserves_above curSlot s sClk (by omega) hclk
+  obtain ⟨_, s₁₀, hls, h10⟩ := bind_ok_elim h9; unfold loadU64 rawLoadU64 at hls; cases hls
+  obtain ⟨_, s₁₁, hrSl, h11⟩ := bind_ok_elim h10; have ⟨hSlB, hs₁₁⟩ := require_ok_elim hrSl; subst s₁₁
+  obtain ⟨_, s₁₂, hnp, h12⟩ := bind_ok_elim h11; unfold loadU64 rawLoadU64 at hnp; cases hnp
+  obtain ⟨_, s₁₃, hfs, h13⟩ := bind_ok_elim h12; unfold loadU8 rawLoadU8 at hfs; cases hfs
+  obtain ⟨_, s₁₄, hfe, h14⟩ := bind_ok_elim h13; unfold loadU64 rawLoadU64 at hfe; cases hfe
+  obtain ⟨_, s₁₅, hrNp, h15⟩ := bind_ok_elim h14; have ⟨hNpB, hs₁₅⟩ := require_ok_elim hrNp; subst s₁₅
+  obtain ⟨_, s₁₆, hop, h16⟩ := bind_ok_elim h15; unfold loadU64 rawLoadU64 at hop; cases hop
+  obtain ⟨_, s₁₇, hoL, h17⟩ := bind_ok_elim h16; unfold loadU64 rawLoadU64 at hoL; cases hoL
+  obtain ⟨_, s₁₈, hoS, h18⟩ := bind_ok_elim h17; unfold loadU64 rawLoadU64 at hoS; cases hoS
+  obtain ⟨_, s₁₉, hrL, h19⟩ := bind_ok_elim h18; unfold loadU64 rawLoadU64 at hrL; cases hrL
+  obtain ⟨_, s₂₀, hrS, h20⟩ := bind_ok_elim h19; unfold loadU64 rawLoadU64 at hrS; cases hrS
+  let mData    := AccountView.dataPtr mkt
+  let lastSlot := sClk.readU64 (mData + MktOff.lastOracleSlot)
+  let newPrice := sClk.readU64 (ix.ptr + 1)
+  let fundE6   := sClk.readU64 (ix.ptr + 10)
+  let oldPrice := sClk.readU64 (mData + MktOff.markPrice)
+  let oiL      := sClk.readU64 (mData + MktOff.oiLong)
+  let oiS      := sClk.readU64 (mData + MktOff.oiShort)
+  let rL       := sClk.readU64 (mData + MktOff.rawBasisLong)
+  let rS       := sClk.readU64 (mData + MktOff.rawBasisShort)
+  have hSlNat : lastSlot.toNat < curSlot.toNat := UInt64.lt_iff_toNat_lt.mp (of_decide_eq_true hSlB)
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hNpB
+  have hNpPos : 0 < newPrice.toNat := UInt64.lt_iff_toNat_lt.mp hNpB.1
+  have hNpLe : newPrice.toNat ≤ MAX_PRICE.toNat := UInt64.le_iff_toNat_le.mp hNpB.2
+  refine ⟨mkt, oracleAuth, ix, pid, curSlot, sClk, hp, hclk, hSlNat, hNpPos, hNpLe, ?_, ?_⟩
+  · intro ⟨h1, h2, h3, h4⟩
+    have hEmp : ((oiL == 0) && (oiS == 0) && (rL == 0) && (rS == 0)) = true := by
+      simp [oiL, oiS, rL, rS, mData, h1, h2, h3, h4]
+    rw [ite_eq_left_of_eq_true _ _ (eq_true hEmp)] at h20
+    obtain ⟨_, _, hrF0, _⟩ := bind_ok_elim h20
+    have ⟨hF0B, _⟩ := require_ok_elim hrF0
+    exact beq_iff_eq.mp hF0B
+  · intro hNotEmp
+    have hEmpF : ((oiL == 0) && (oiS == 0) && (rL == 0) && (rS == 0)) = false := by
+      cases hEq : ((oiL == 0) && (oiS == 0) && (rL == 0) && (rS == 0))
+      · rfl
+      · simp only [Bool.and_eq_true, beq_iff_eq] at hEq
+        exact absurd ⟨hEq.1.1.1, hEq.1.1.2, hEq.1.2, hEq.2⟩ hNotEmp
+    rw [ite_eq_right_of_eq_false _ _ (eq_false (by rw [hEmpF]; decide))] at h20
+    obtain ⟨rawMaxMove, s₂₂, hrmm, h20⟩ := bind_ok_elim h20; unfold loadU64 rawLoadU64 at hrmm; cases hrmm
+    obtain ⟨maxAllowed, s₂₃, hmd, h20⟩ := bind_ok_elim h20
+    have ⟨_, hmaNat, _, _⟩ := LeanSVM.Math.mulDiv64_ok_spec _ _ _ _ _ _ (by omega) hmd
+    have hbd : BPS_DEN.toNat = 10_000 := rfl; rw [hbd] at hmaNat
+    obtain ⟨totMove, s₂₄, hadd, h20⟩ := bind_ok_elim h20
+    have ⟨_, _, hTotNat, hs₂₄⟩ := checkedAdd64_ok_spec _ _ _ _ _ hadd; subst s₂₄
+    obtain ⟨_, s₂₅, hrCl, _⟩ := bind_ok_elim h20
+    have ⟨hClB, _⟩ := require_ok_elim hrCl
+    have hClN : totMove.toNat ≤ maxAllowed.toNat := UInt64.le_iff_toNat_le.mp (of_decide_eq_true hClB)
+    have hDiffEq : (if newPrice ≥ oldPrice then newPrice - oldPrice else oldPrice - newPrice).toNat =
+        if newPrice.toNat ≥ oldPrice.toNat then newPrice.toNat - oldPrice.toNat else oldPrice.toNat - newPrice.toNat := by
+      by_cases hge : newPrice ≥ oldPrice
+      · have hgeN : newPrice.toNat ≥ oldPrice.toNat := UInt64.le_iff_toNat_le.mp hge
+        rw [ite_eq_left_of_eq_true _ _ (eq_true hge), ite_eq_left_of_eq_true _ _ (eq_true hgeN),
+            u64_sub_toNat_le newPrice oldPrice hgeN]
+      · have hltN : ¬ (newPrice.toNat ≥ oldPrice.toNat) := fun hg => hge (UInt64.le_iff_toNat_le.mpr hg)
+        rw [ite_eq_right_of_eq_false _ _ (eq_false hge), ite_eq_right_of_eq_false _ _ (eq_false hltN),
+            u64_sub_toNat_le oldPrice newPrice (by omega)]
+    dsimp only [newPrice, oldPrice, mData] at hDiffEq
+    rw [hDiffEq] at hTotNat
+    omega
+
 end Percolator.HandlerProofs

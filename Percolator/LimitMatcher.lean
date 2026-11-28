@@ -72,23 +72,25 @@ namespace OrdFlag
   def priceImprove : UInt8 := 8 -- bit 3: Improve limit fill price to `markPrice` when favorable
 end OrdFlag
 
-/-! Zero-copy Multi-Order Limit Book Context (`864` bytes, 8-byte aligned):
+/-! Zero-copy Multi-Order Limit Book Context (`896` bytes, 8-byte aligned):
     - `[0..16)`    standard `MatcherReturn` header (`magic="MRET"`, `status`, `seq`)
     - `[16..144)`  8 × 16B `(execPrice:u64, fillQty:u64)` quote return slots (`k ∈ [1..8]`)
     - `[144..176)` `owner: Pubkey` (EOA who owns/places/cancels orders)
     - `[176..208)` `percolatorProg: Pubkey` (IMMUTABLE pinned `Percolator` program ID)
-    - `[208..209)` `paused: u8`
-    - `[224..864)` 8 × 80B `OrderSlot` records -/
+    - `[208..240)` `dex: Pubkey` (IMMUTABLE pinned `Percolator` `Dex` — blocks cross-DEX market spoofing!)
+    - `[240..241)` `paused: u8`
+    - `[256..896)` 8 × 80B `OrderSlot` records -/
 namespace BookOff
-  def size           : UInt64 := 864
+  def size           : UInt64 := 896
   def magic          : UInt64 := 0
   def status         : UInt64 := 4
   def seq            : UInt64 := 8
   def quotesBase     : UInt64 := 16
   def owner          : UInt64 := 144
   def percolatorProg : UInt64 := 176
-  def paused         : UInt64 := 208
-  def ordersBase     : UInt64 := 224
+  def dex            : UInt64 := 208
+  def paused         : UInt64 := 240
+  def ordersBase     : UInt64 := 256
   def orderStride    : UInt64 := 80
 end BookOff
 
@@ -114,12 +116,41 @@ end OrdOff
 
 theorem limit_book_layout_valid :
     BookOff.quotesBase + MAX_LEGS * 16 ≤ BookOff.owner ∧
-    BookOff.percolatorProg + 32 ≤ BookOff.paused ∧
+    BookOff.percolatorProg + 32 ≤ BookOff.dex ∧
+    BookOff.dex + 32 ≤ BookOff.paused ∧
     BookOff.paused + 1 ≤ BookOff.ordersBase ∧
     OrdOff.lastFillSlot + 8 ≤ BookOff.orderStride ∧
     BookOff.ordersBase + MAX_ORDERS * BookOff.orderStride == BookOff.size ∧
     BookOff.size % 8 == 0 := by
   decide
+
+/-- Wrap-free `UInt64` TWAP cooldown gate: returns `true` iff this is the first fill (`lastSl == 0`)
+    or `curSlot ≥ lastSl` and `curSlot - lastSl ≥ interval` (100% immune to `lastSl + interval` `u64` wraparound!). -/
+@[inline] def twapReadyU64 (curSlot lastSl interval : UInt64) : Bool :=
+  lastSl == 0 || (curSlot >= lastSl && (curSlot - lastSl) >= interval)
+
+/-- Exact `Nat` characterization of `twapReadyU64`: proves ZERO `UInt64` wraparound bypass for ALL
+    `(curSlot, lastSl, interval) : UInt64` — even `interval = u64::MAX`! -/
+theorem twapReadyU64_iff_exact_nat (curSlot lastSl interval : UInt64) :
+    twapReadyU64 curSlot lastSl interval = true ↔
+      lastSl.toNat = 0 ∨ lastSl.toNat + interval.toNat ≤ curSlot.toNat := by
+  unfold twapReadyU64
+  simp only [Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq]
+  constructor
+  · rintro (h0 | ⟨hge, hsub⟩)
+    · left; rw [h0]; rfl
+    · right
+      have hgeN : lastSl.toNat ≤ curSlot.toNat := UInt64.le_iff_toNat_le.mp hge
+      have hsubN : interval.toNat ≤ (curSlot - lastSl).toNat := UInt64.le_iff_toNat_le.mp hsub
+      rw [UInt64.toNat_sub_of_le curSlot lastSl hge] at hsubN
+      omega
+  · rintro (h0 | hle)
+    · left; exact UInt64.toNat_inj.mp (by rw [h0]; rfl)
+    · right
+      have hge : lastSl ≤ curSlot := UInt64.le_iff_toNat_le.mpr (by omega)
+      refine ⟨hge, UInt64.le_iff_toNat_le.mpr ?_⟩
+      rw [UInt64.toNat_sub_of_le curSlot lastSl hge]
+      omega
 
 /-- Pure partial-fill conservation: `fillQty = min maxQty cap` never over-fills and conserves
     `(rem - fillQty) + fillQty = rem` whenever `cap ≤ rem`. -/
@@ -173,9 +204,9 @@ theorem trailing_watermark_monotone (makerIsBuy : Bool) (oldWm markP : Nat) :
 
 /-- Verify `sysvarAcc` is the canonical Solana `Sysvar1nstructions` account and that the
     currently executing top-level instruction is `Percolator::TradeWithMatcher` (`op == 23`)
-    targeting this exact `ctx` at account index `5`! -/
+    targeting BOTH this exact `dex` at account index `0` AND this exact `ctx` at account index `5`! -/
 @[noinline] def checkCallerIsPercolatorTradeWithMatcher
-    (ctx sysvarAcc : AccountView) (percolatorProgPtr : Ptr) : SolanaM Unit := do
+    (ctx sysvarAcc : AccountView) (percolatorProgPtr dexPtr : Ptr) : SolanaM Unit := do
   let sk := AccountView.keyPtr sysvarAcc
   let w0 ← loadU64 sk 0
   let w1 ← loadU64 sk 8
@@ -196,6 +227,8 @@ theorem trailing_watermark_monotone (makerIsBuy : Bool) (oldWm markP : Nat) :
   SolanaM.require (numAccs >= 8 && numAccs <= 64) LErr.wrongCaller
   let accBytes := numAccs * 33
   SolanaM.require (ixStart + 37 + accBytes <= sysLen) LErr.badSysvar
+  -- Account 0 is `dex` (`p + 2 + 0*33 + 1 = p + 3`), account 5 is `matcherCtx` (`p + 2 + 5*33 + 1 = p + 168`)!
+  SolanaM.require (← pubkeyEq (p + 3)   dexPtr)                 LErr.wrongCaller
   SolanaM.require (← pubkeyEq (p + 168) (AccountView.keyPtr ctx)) LErr.wrongCaller
   SolanaM.require (← pubkeyEq (p + 2 + accBytes) percolatorProgPtr) LErr.wrongCaller
   let topDataLen := (← loadU16 p (34 + accBytes)).toUInt64
@@ -323,10 +356,10 @@ decreasing_by
     if !fired then return false
     execP ← computeTriggerExecPrice makerIsBuy markP maxDelta limitP 0
   else if otype == OrdType.twap then
-    -- TWAP Slicer: sliceQty = trigP, intervalSlots = paramA
+    -- TWAP Slicer: sliceQty = trigP, intervalSlots = paramA (wrap-free `twapReadyU64`!)
     if trigP == 0 then return false
     let lastSl ← loadU64 op OrdOff.lastFillSlot
-    if lastSl != 0 && curSlot < lastSl + paramA then return false
+    if !twapReadyU64 curSlot lastSl paramA then return false
     capQty := if trigP < rem then trigP else rem
     execP ← computeTriggerExecPrice makerIsBuy markP maxDelta limitP 0
   else
@@ -417,21 +450,26 @@ decreasing_by
 
 /-! ### 6 Minimal Instructions (`InitBook`, `PlaceOrder`, `FillOrders`, `CancelOrder`, `CancelAll`, `CrankTrailing`) -/
 
-/-- Op 0 (`InitBook`): Initialize an 864-byte 8-slot `LimitBookCtx` (`magic == 0`, pins `owner` & `percolatorProg`).
-    Accounts: `0. ctx (W)`, `1. owner (S)`, `2. percolatorProg`. Ix data (1B): `[0]`. -/
+/-- Op 0 (`InitBook`): Initialize an 896-byte 8-slot `LimitBookCtx` (`magic == 0`, pins `owner`, `percolatorProg`, and `dex`).
+    Accounts: `0. ctx (W)`, `1. owner (S)`, `2. percolatorProg`, `3. dex` (valid `Percolator` `Dex` account). Ix data (1B): `[0]`. -/
 def handleInitBook (input : Ptr) : SolanaM Unit := do
-  let (ctx, owner, percProg, _, progId) ← parseStrict3 input PErr.aliasedAccounts
+  let (ctx, owner, percProg, dex, _, progId) ← parseStrict4 input PErr.aliasedAccounts
   SolanaM.require (← AccountView.isSigner owner) Err.missingRequiredSignature
   SolanaM.require (← AccountView.isWritable ctx) Err.invalidAccountData
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr ctx) progId) Err.illegalOwner
   SolanaM.require ((← AccountView.dataLen ctx) == BookOff.size) Err.invalidAccountData
   let d := AccountView.dataPtr ctx
   SolanaM.require ((← loadU32 d BookOff.magic) == 0) Err.accountAlreadyInitialized
+  -- Validate genuine `Dex` owned by `percProg` (`MAGIC_DEX`, exact `DexOff.size`)!
+  SolanaM.require (← pubkeyEq (AccountView.ownerPtr dex) (AccountView.keyPtr percProg)) LErr.badMarket
+  SolanaM.require ((← AccountView.dataLen dex) == DexOff.size) LErr.badMarket
+  SolanaM.require ((← loadU32 (AccountView.dataPtr dex) DexOff.magic) == MAGIC_DEX) LErr.badMarket
   zeroWords d 0 (BookOff.size >>> 3)
   storeU32 d BookOff.magic  MAGIC_MRET
   storeU32 d BookOff.status 0
   pubkeyCopy (d + BookOff.owner)          (AccountView.keyPtr owner)
   pubkeyCopy (d + BookOff.percolatorProg) (AccountView.keyPtr percProg)
+  pubkeyCopy (d + BookOff.dex)            (AccountView.keyPtr dex)
 
 /-- Op 1 (`PlaceOrder`): Owner writes/replaces an order in slot `slotIdx ∈ 0..7`.
     Accounts: `0. ctx (W)`, `1. owner (S)`.
@@ -501,7 +539,7 @@ def handleFillOrders (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← loadU32 d BookOff.magic) == MAGIC_MRET) PErr.invalidMagic
   SolanaM.require ((← loadU8 d BookOff.paused) == 0) LErr.paused
 
-  checkCallerIsPercolatorTradeWithMatcher ctx sysvarIx (d + BookOff.percolatorProg)
+  checkCallerIsPercolatorTradeWithMatcher ctx sysvarIx (d + BookOff.percolatorProg) (d + BookOff.dex)
 
   let k := (← loadU8 ix.ptr 1).toUInt64
   SolanaM.require (k >= 1 && k <= MAX_LEGS && ix.len >= 32 + k * 48) Err.invalidInstructionData
@@ -553,11 +591,12 @@ def handleCrankTrailing (input : Ptr) : SolanaM Unit := do
   SolanaM.require ((← AccountView.dataLen ctx) == BookOff.size) Err.invalidAccountData
   let d := AccountView.dataPtr ctx
   SolanaM.require ((← loadU32 d BookOff.magic) == MAGIC_MRET) PErr.invalidMagic
-  -- Verify `mkt` is a genuine `Percolator` Market account!
+  -- Verify `mkt` is a genuine `Percolator` Market account belonging to this book's pinned `dex`!
   SolanaM.require (← pubkeyEq (AccountView.ownerPtr mkt) (d + BookOff.percolatorProg)) LErr.badMarket
   SolanaM.require ((← AccountView.dataLen mkt) == MktOff.size) LErr.badMarket
   let mData := AccountView.dataPtr mkt
   SolanaM.require ((← loadU32 mData MktOff.magic) == MAGIC_MARKET) LErr.badMarket
+  SolanaM.require (← pubkeyEq (mData + MktOff.dex) (d + BookOff.dex)) LErr.badMarket
 
   let slotIdx := (← loadU8 ix.ptr 1).toUInt64
   SolanaM.require (slotIdx < MAX_ORDERS) LErr.badSlot

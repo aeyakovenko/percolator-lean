@@ -106,6 +106,9 @@ def loadOptU8 (ixPtr ixLen off : UInt64) : SolanaM UInt8 := do
 def loadOptU64 (ixPtr ixLen off : UInt64) : SolanaM UInt64 := do
   if ixLen >= off + 8 then loadU64 ixPtr off else return 0
 
+@[inline] def loadOptRewardBps (ixPtr ixLen : UInt64) : SolanaM UInt64 := do
+  if ixLen >= 140 then loadU64 ixPtr 100 else return 0
+
 def checkOracleFresh (mData : Ptr) (curSlot : UInt64) : SolanaM Unit := do
   let lastSlot ← loadU64 mData MktOff.lastOracleSlot
   let maxStale ← loadU64 mData MktOff.maxStaleness
@@ -666,8 +669,8 @@ def handleCreateMarket (input : Ptr) : SolanaM Unit := do
   let maxMoveBps    ← loadU64 ix.ptr 68
   let maxInsDrawBps ← loadU64 ix.ptr 76
   let maxOi         ← loadU64 ix.ptr 84
-  let minMm         ← if ix.len >= 100 then loadU64 ix.ptr 92 else pure 0
-  let rewardBps     ← if ix.len >= 140 then loadU64 ix.ptr 100 else pure 0
+  let minMm         ← loadOptU64 ix.ptr ix.len 92
+  let rewardBps     ← loadOptRewardBps ix.ptr ix.len
 
   SolanaM.require (maxFrontBps.toUInt64 <= maxInsDrawBps && maxInsDrawBps <= BPS_DEN) PErr.invalidParams
   SolanaM.require (rewardBps <= BPS_DEN) PErr.invalidParams
@@ -1157,6 +1160,10 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     let oiL' ← checkedAdd64 oiL qty
     let oiS' ← checkedAdd64 oiS qty
     SolanaM.require (oiL' <= maxOi && oiS' <= maxOi) PErr.oiLimitExceeded
+    let markP ← loadU64 mData MktOff.markPrice
+    let maxOi' := if oiL' > oiS' then oiL' else oiS'
+    let openNot ← mulDiv64Ceil maxOi' markP POS_SCALE
+    SolanaM.require (openNot <= MAX_MKT_NOTIONAL) PErr.oiLimitExceeded
 
     let rawAddL ← postAdlRawAddU64 qty oiL rL
     let rawAddS ← postAdlRawAddU64 qty oiS rS
@@ -1164,7 +1171,6 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     let rS' ← checkedAdd64 rS rawAddS
     SolanaM.require (rL' <= MAX_RAW && rS' <= MAX_RAW && oiL' <= rL' && oiS' <= rS') PErr.oiLimitExceeded
 
-    let markP ← loadU64 mData MktOff.markPrice
     let fee ← computeMarginReq qty markP (← loadU64 mData MktOff.tradeFeeBps)
     if fee > 0 then
       let cL ← loadU64 fLData PflOff.capital
@@ -1304,6 +1310,11 @@ def creditTradeFee (dData mData : Ptr) (totalFee : UInt64) : SolanaM Unit := do
     let _ ← settleAndRefreshLeg dData mData fSData slotBuy  curSlot false false
 
     let rSell ← loadU64 lpSell LegOff.rawBasis
+    SolanaM.require (rSell > 0 && rMktSide > 0) PErr.invalidParams
+    let capSell ←
+      if oiSide == rMktSide then pure (if rSell < oiSide then rSell else oiSide)
+      else do let q ← mulDiv64Ceil rSell oiSide rMktSide; pure (if q < oiSide then q else oiSide)
+    SolanaM.require (qty <= capSell) PErr.invalidParams
     let rawXfer ← proportionalRawRedU64 qty rSell rMktSide oiSide
     SolanaM.require (rawXfer > 0 && rSell >= rawXfer) PErr.invalidParams
 

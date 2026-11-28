@@ -639,13 +639,16 @@ theorem checkTokenProg_sound (tokProg : AccountView) (s s' : SvmState)
     · rw [ite_eq_right_of_eq_false _ _ (eq_false h1)] at h; dsimp only [SolanaM.fail] at h; cases h
   · rw [ite_eq_right_of_eq_false _ _ (eq_false h0)] at h; dsimp only [SolanaM.fail] at h; cases h
 
-/-- **Refinement #9 (`applyExecSpread` Zero-Sum Capital Conservation & Exec-Price Clamp)**:
-    On disjoint valid `mData`, `fLData`, `fSData` above the stack:
+/-- **Refinement #9 (`applyExecSpread` Zero-Sum Capital Conservation, Optional Clamp & All-Leg `lockedMm` Firewall)**:
+    Directly on `Program.applyExecSpread` for **BOTH** `clampSpread = true` (`mode = 0/2/3`, unprotected closes)
+    AND `clampSpread = false` (unclamped `mode = 1` real-price outage closes):
     1. `fL.capital + fS.capital` is conserved BIT-FOR-BIT (`C_L' + C_S' = C_L + C_S`)!
-    2. When `execPrice ≠ 0`, `|execPrice - markPrice| ≤ ⌊markPrice * maxMoveBps / 10_000⌋`!
-    3. Every byte of `mData` (and every byte outside `fL.capital`/`fS.capital` above `stackSp`) is preserved! -/
+    2. When `clampSpread = true` and `execPrice ≠ 0`, `|execPrice - markPrice| ≤ ⌊markPrice * maxMoveBps / 10_000⌋`!
+    3. Every byte of `mData` is preserved!
+    4. **ALL 8 legs' `lockedMm` on BOTH `fLData` AND `fSData` are BIT-FOR-BIT UNTOUCHED** — even an
+       unclamped `mode = 1` spread can NEVER raid any leg's isolated `lockedMm` firewall! -/
 theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execPrice : UInt64)
-    (s s' : SvmState)
+    (clampSpread : Bool) (s s' : SvmState)
     (hsp : 16 ≤ s.stackSp.toNat)
     (hmV : regionValid mData MktOff.size)
     (hLV : regionValid fLData PflOff.size)
@@ -654,19 +657,39 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
     (hLS : regionDisjoint fLData PflOff.size fSData PflOff.size)
     (hML : regionDisjoint mData MktOff.size fLData PflOff.size)
     (hMS : regionDisjoint mData MktOff.size fSData PflOff.size)
-    (h : applyExecSpread mData fLData fSData qty execPrice true s = .ok () s') :
+    (h : applyExecSpread mData fLData fSData qty execPrice clampSpread s = .ok () s') :
     (s'.readU64 (fLData + PflOff.capital)).toNat + (s'.readU64 (fSData + PflOff.capital)).toNat =
       (s.readU64 (fLData + PflOff.capital)).toNat + (s.readU64 (fSData + PflOff.capital)).toNat ∧
-    (execPrice ≠ 0 →
+    (clampSpread = true → execPrice ≠ 0 →
       (let markP := s.readU64 (mData + MktOff.markPrice)
        let diff := if execPrice > markP then execPrice - markP else markP - execPrice
        diff.toNat ≤ (markP.toNat * (s.readU64 (mData + MktOff.maxMoveBps)).toNat) / Spec.bpsDenNat)) ∧
-    (∀ off : UInt64, off < MktOff.size → s'.mem (mData + off) = s.mem (mData + off)) := by
+    (∀ off : UInt64, off < MktOff.size → s'.mem (mData + off) = s.mem (mData + off)) ∧
+    (∀ j : UInt64, j < MAX_LEGS →
+      s'.readU64 (legPtrAt fLData j + LegOff.lockedMm) = s.readU64 (legPtrAt fLData j + LegOff.lockedMm) ∧
+      s'.readU64 (legPtrAt fSData j + LegOff.lockedMm) = s.readU64 (legPtrAt fSData j + LegOff.lockedMm)) := by
+  have hLegAddr : ∀ (p : Ptr) (hpV : regionValid p PflOff.size) (j : UInt64), j < MAX_LEGS →
+      (legPtrAt p j + LegOff.lockedMm).toNat = p.toNat + 144 + j.toNat * 104 + 96 ∧
+      (legPtrAt p j + LegOff.lockedMm).toNat + 8 < 2 ^ 64 := by
+    intro p hpV j hj
+    have hp976 : p.toNat + 976 < 2 ^ 64 := hpV
+    have hjLt : j.toNat < 8 := UInt64.lt_iff_toNat_lt.mp hj
+    have hlj : (legPtrAt p j).toNat = p.toNat + 144 + j.toNat * 104 := by
+      unfold legPtrAt
+      have h1 : (p + PflOff.headerSize).toNat = p.toNat + 144 :=
+        u64_add_toNat_of_lt _ _ (by show p.toNat + 144 < 2 ^ 64; omega)
+      have h2 : (j * PflOff.legStride).toNat = j.toNat * 104 := by
+        have : PflOff.legStride.toNat = 104 := rfl; rw [UInt64.toNat_mul, this, Nat.mod_eq_of_lt (by omega)]
+      rw [u64_add_toNat_of_lt _ _ (by rw [h1, h2]; omega), h1, h2]
+    have h96 : LegOff.lockedMm.toNat = 96 := rfl
+    have ha : (legPtrAt p j + LegOff.lockedMm).toNat = p.toNat + 144 + j.toNat * 104 + 96 := by
+      rw [u64_add_toNat_of_lt _ _ (by rw [hlj]; omega), hlj, h96]
+    exact ⟨ha, by rw [ha]; omega⟩
   unfold applyExecSpread at h
   by_cases he0 : (execPrice == 0) = true
   · rw [ite_eq_left_of_eq_true _ _ (eq_true he0)] at h
     dsimp only [Pure.pure, SolanaM.pure] at h; cases h
-    exact ⟨rfl, fun hne => absurd (beq_iff_eq.mp he0) hne, fun _ _ => rfl⟩
+    exact ⟨rfl, fun _ hne => absurd (beq_iff_eq.mp he0) hne, fun _ _ => rfl, fun _ _ => ⟨rfl, rfl⟩⟩
   · rw [ite_eq_right_of_eq_false _ _ (eq_false he0)] at h
     unfold loadU64 rawLoadU64 at h
     simp only [Bind.bind, SolanaM.bind] at h
@@ -675,8 +698,8 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
     · rw [ite_eq_left_of_eq_true _ _ (eq_true heq)] at h
       dsimp only [Pure.pure, SolanaM.pure] at h; cases h
       have hEq : execPrice = markP := beq_iff_eq.mp heq
-      refine ⟨rfl, ?_, fun _ _ => rfl⟩
-      intro _
+      refine ⟨rfl, ?_, fun _ _ => rfl, fun _ _ => ⟨rfl, rfl⟩⟩
+      intro _ _
       change (if execPrice > markP then execPrice - markP else markP - execPrice).toNat ≤ _
       rw [hEq]
       have hnot : ¬ (markP > markP) := by intro hlt; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
@@ -684,139 +707,213 @@ theorem applyExecSpread_conserves_capital (mData fLData fSData : Ptr) (qty execP
       have h0 : (markP - markP).toNat = 0 := by rw [u64_sub_toNat_of_le markP markP (Nat.le_refl _)]; omega
       rw [h0]; exact Nat.zero_le _
     · rw [ite_eq_right_of_eq_false _ _ (eq_false heq)] at h
-      simp only [ite_true] at h
-      unfold SolanaM.bind at h; dsimp only at h
       let diff := if execPrice > markP then execPrice - markP else markP - execPrice
       let maxBps := s.readU64 (mData + MktOff.maxMoveBps)
-      cases hms : mulDiv64 markP maxBps BPS_DEN s with
-      | err c st => rw [hms] at h; cases h
-      | ok maxSlip s1 =>
-        rw [hms] at h; dsimp only at h
-        have ⟨_, hmaxSlip, hsp1Le, hsp1Lo, hmem1⟩ := mulDiv64_stack_and_mem (by omega) hms
-        simp only [SolanaM.require, decide_eq_true_eq] at h
-        by_cases hclamp : diff ≤ maxSlip
-        · rw [ite_eq_left_of_eq_true _ _ (eq_true hclamp)] at h
-          dsimp only [SolanaM.pure] at h
-          have hclampNat : diff.toNat ≤ (markP.toNat * maxBps.toNat) / Spec.bpsDenNat := by
-            have := UInt64.le_iff_toNat_le.mp hclamp
-            have hbd : BPS_DEN.toNat = Spec.bpsDenNat := rfl
-            rw [hbd] at hmaxSlip; omega
-          cases hsp2 : mulDiv64Ceil qty diff POS_SCALE s1 with
-          | err c st => rw [hsp2] at h; cases h
-          | ok spread s2 =>
-            rw [hsp2] at h; dsimp only at h
-            have ⟨_, _, _, _, hmem2⟩ := mulDiv64Ceil_stack_and_mem (by omega) hsp2
-            have hmem20 : memEqAbove s2 s s.stackSp :=
-              memEqAbove_trans (memEqAbove_mono hmem2 hsp1Le) hmem1
-            have hmOff : ∀ off : UInt64, off < MktOff.size → s2.mem (mData + off) = s.mem (mData + off) := by
-              intro off hoff
-              have hlt : mData.toNat + off.toNat < 2 ^ 64 := by
-                have := UInt64.lt_iff_toNat_lt.mp hoff; unfold regionValid at hmV; omega
-              exact hmem20 (mData + off) (u64_le_of_add_lt s.stackSp mData off (UInt64.le_iff_toNat_le.mp hmSt) hlt)
-            have hLcap2 : s2.readU64 (fLData + PflOff.capital) = s.readU64 (fLData + PflOff.capital) := by
-              have hlt : (fLData + PflOff.capital).toNat + 8 ≤ 2 ^ 64 := by
-                rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]
-                unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega
-              have hlo : s.stackSp ≤ fLData + PflOff.capital :=
-                u64_le_of_add_lt s.stackSp fLData PflOff.capital (UInt64.le_iff_toNat_le.mp hLSt)
-                  (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)
-              exact readU64_of_memEqAbove hmem20 hlo hlt
-            have hScap2 : s2.readU64 (fSData + PflOff.capital) = s.readU64 (fSData + PflOff.capital) := by
-              have hlt : (fSData + PflOff.capital).toNat + 8 ≤ 2 ^ 64 := by
-                rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
-                unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega
-              have hlo : s.stackSp ≤ fSData + PflOff.capital :=
-                u64_le_of_add_lt s.stackSp fSData PflOff.capital (UInt64.le_iff_toNat_le.mp hSSt)
-                  (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)
-              exact readU64_of_memEqAbove hmem20 hlo hlt
-            have hLptrLt : (fLData + PflOff.capital).toNat + 8 < 2 ^ 64 := by
-              rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]
-              unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega
-            have hSptrLt : (fSData + PflOff.capital).toNat + 8 < 2 ^ 64 := by
-              rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
-              unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega
-            have hLSdisj : (fLData + PflOff.capital).toNat + 8 ≤ (fSData + PflOff.capital).toNat ∨
-                (fSData + PflOff.capital).toNat + 8 ≤ (fLData + PflOff.capital).toNat := by
-              rw [u64_add_toNat_of_lt fLData PflOff.capital (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega),
-                  u64_add_toNat_of_lt fSData PflOff.capital (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
-              unfold regionDisjoint at hLS; simp [PflOff.capital, PflOff.size] at *; omega
-            have hLcapOff : (fLData + PflOff.capital).toNat = fLData.toNat + 88 := by
-              rw [u64_add_toNat_of_lt fLData PflOff.capital (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]; rfl
-            have hScapOff : (fSData + PflOff.capital).toNat = fSData.toNat + 88 := by
-              rw [u64_add_toNat_of_lt fSData PflOff.capital (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]; rfl
-            by_cases hspPos : spread > 0
-            · rw [ite_eq_left_of_eq_true _ _ (eq_true hspPos)] at h
-              by_cases hgt : execPrice > markP
-              · rw [ite_eq_left_of_eq_true _ _ (eq_true hgt)] at h
-                let cL := s2.readU64 (fLData + PflOff.capital)
-                by_cases hgeL : cL ≥ spread
-                · rw [ite_eq_left_of_eq_true _ _ (eq_true hgeL)] at h
-                  dsimp only [SolanaM.pure, storeU64, rawStoreU64] at h
-                  have ⟨haddLt, hs'⟩ := addU64At_ok_spec fSData PflOff.capital spread (s2.writeU64 (fLData + PflOff.capital) (cL - spread)) s' h
-                  subst hs'
-                  have hSread : (s2.writeU64 (fLData + PflOff.capital) (cL - spread)).readU64 (fSData + PflOff.capital) =
-                      s2.readU64 (fSData + PflOff.capital) :=
-                    readU64_writeU64_of_disjNat s2 _ _ _ hLptrLt hSptrLt hLSdisj
-                  rw [hSread] at haddLt ⊢
-                  have hLfin : ((s2.writeU64 (fLData + PflOff.capital) (cL - spread)).writeU64 (fSData + PflOff.capital) (s2.readU64 (fSData + PflOff.capital) + spread)).readU64 (fLData + PflOff.capital) = cL - spread := by
-                    rw [readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hLptrLt hLSdisj.symm, SvmState.readU64_writeU64_same]
-                  have hSfin : ((s2.writeU64 (fLData + PflOff.capital) (cL - spread)).writeU64 (fSData + PflOff.capital) (s2.readU64 (fSData + PflOff.capital) + spread)).readU64 (fSData + PflOff.capital) =
-                      s2.readU64 (fSData + PflOff.capital) + spread := SvmState.readU64_writeU64_same _ _ _
-                  refine ⟨?_, fun _ => hclampNat, ?_⟩
-                  · rw [hLfin, hSfin, u64_sub_toNat_of_le cL spread (UInt64.le_iff_toNat_le.mp hgeL),
-                        u64_add_toNat_of_lt _ _ haddLt]
-                    have hcL : cL = s.readU64 (fLData + PflOff.capital) := hLcap2
-                    rw [hcL, hScap2]
-                    have := UInt64.le_iff_toNat_le.mp hgeL; rw [hcL] at this; omega
-                  · intro off hoff
-                    have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
-                    have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
-                      u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
-                    have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
-                      rw [hmAdd, hScapOff]; unfold regionDisjoint at hMS; simp [MktOff.size, PflOff.size] at *; omega
-                    have hMLd : (mData + off).toNat < (fLData + PflOff.capital).toNat ∨ (fLData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
-                      rw [hmAdd, hLcapOff]; unfold regionDisjoint at hML; simp [MktOff.size, PflOff.size] at *; omega
-                    have e1 := readU8_writeU64_of_disjNat (s2.writeU64 (fLData + PflOff.capital) (cL - spread)) (fSData + PflOff.capital) (mData + off) (s2.readU64 (fSData + PflOff.capital) + spread) hSptrLt hMSd
-                    have e2 := readU8_writeU64_of_disjNat s2 (fLData + PflOff.capital) (mData + off) (cL - spread) hLptrLt hMLd
-                    exact (e1.trans e2).trans (hmOff off hoff)
-                · rw [ite_eq_right_of_eq_false _ _ (eq_false hgeL)] at h; dsimp only [SolanaM.fail] at h; cases h
-              · rw [ite_eq_right_of_eq_false _ _ (eq_false hgt)] at h
-                let cS := s2.readU64 (fSData + PflOff.capital)
-                by_cases hgeS : cS ≥ spread
-                · rw [ite_eq_left_of_eq_true _ _ (eq_true hgeS)] at h
-                  dsimp only [SolanaM.pure, storeU64, rawStoreU64] at h
-                  have ⟨haddLt, hs'⟩ := addU64At_ok_spec fLData PflOff.capital spread (s2.writeU64 (fSData + PflOff.capital) (cS - spread)) s' h
-                  subst hs'
-                  have hLread : (s2.writeU64 (fSData + PflOff.capital) (cS - spread)).readU64 (fLData + PflOff.capital) =
-                      s2.readU64 (fLData + PflOff.capital) :=
-                    readU64_writeU64_of_disjNat s2 _ _ _ hSptrLt hLptrLt hLSdisj.symm
-                  rw [hLread] at haddLt ⊢
-                  have hSfin : ((s2.writeU64 (fSData + PflOff.capital) (cS - spread)).writeU64 (fLData + PflOff.capital) (s2.readU64 (fLData + PflOff.capital) + spread)).readU64 (fSData + PflOff.capital) = cS - spread := by
-                    rw [readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hSptrLt hLSdisj, SvmState.readU64_writeU64_same]
-                  have hLfin : ((s2.writeU64 (fSData + PflOff.capital) (cS - spread)).writeU64 (fLData + PflOff.capital) (s2.readU64 (fLData + PflOff.capital) + spread)).readU64 (fLData + PflOff.capital) =
-                      s2.readU64 (fLData + PflOff.capital) + spread := SvmState.readU64_writeU64_same _ _ _
-                  refine ⟨?_, fun _ => hclampNat, ?_⟩
-                  · rw [hLfin, hSfin, u64_sub_toNat_of_le cS spread (UInt64.le_iff_toNat_le.mp hgeS),
-                        u64_add_toNat_of_lt _ _ haddLt]
-                    have hcS : cS = s.readU64 (fSData + PflOff.capital) := hScap2
-                    rw [hcS, hLcap2]
-                    have := UInt64.le_iff_toNat_le.mp hgeS; rw [hcS] at this; omega
-                  · intro off hoff
-                    have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
-                    have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
-                      u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
-                    have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
-                      rw [hmAdd, hScapOff]; unfold regionDisjoint at hMS; simp [MktOff.size, PflOff.size] at *; omega
-                    have hMLd : (mData + off).toNat < (fLData + PflOff.capital).toNat ∨ (fLData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
-                      rw [hmAdd, hLcapOff]; unfold regionDisjoint at hML; simp [MktOff.size, PflOff.size] at *; omega
-                    have e1 := readU8_writeU64_of_disjNat (s2.writeU64 (fSData + PflOff.capital) (cS - spread)) (fLData + PflOff.capital) (mData + off) (s2.readU64 (fLData + PflOff.capital) + spread) hLptrLt hMLd
-                    have e2 := readU8_writeU64_of_disjNat s2 (fSData + PflOff.capital) (mData + off) (cS - spread) hSptrLt hMSd
-                    exact (e1.trans e2).trans (hmOff off hoff)
-                · rw [ite_eq_right_of_eq_false _ _ (eq_false hgeS)] at h; dsimp only [SolanaM.fail] at h; cases h
-            · rw [ite_eq_right_of_eq_false _ _ (eq_false hspPos)] at h
-              dsimp only [Pure.pure, SolanaM.pure] at h; cases h
-              exact ⟨by rw [hLcap2, hScap2], fun _ => hclampNat, hmOff⟩
-        · rw [ite_eq_right_of_eq_false _ _ (eq_false hclamp)] at h; dsimp only [SolanaM.fail] at h; cases h
+      -- Eliminate the optional `if clampSpread then ...` prefix cleanly into `(s1, hsp1Le, hsp1Lo, hmem1, hClamp)`!
+      have hAfterClamp : ∃ s1, s1.stackSp ≤ s.stackSp ∧ s.stackSp.toNat - 8 ≤ s1.stackSp.toNat ∧
+          memEqAbove s1 s s.stackSp ∧
+          (clampSpread = true → diff.toNat ≤ (markP.toNat * maxBps.toNat) / Spec.bpsDenNat) ∧
+          (do
+            let spread ← mulDiv64Ceil qty diff POS_SCALE
+            if spread > 0 then
+              if execPrice > markP then
+                let cL ← loadU64 fLData PflOff.capital
+                SolanaM.require (cL ≥ spread) PErr.insufficientFunds
+                storeU64 fLData PflOff.capital (cL - spread)
+                addU64At fSData PflOff.capital spread
+              else
+                let cS ← loadU64 fSData PflOff.capital
+                SolanaM.require (cS ≥ spread) PErr.insufficientFunds
+                storeU64 fSData PflOff.capital (cS - spread)
+                addU64At fLData PflOff.capital spread) s1 = .ok () s' := by
+        unfold loadU64 rawLoadU64
+        cases clampSpread
+        · simp only [Bool.false_eq_true, ↓reduceIte, Pure.pure, Bind.bind, SolanaM.bind] at h ⊢
+          exact ⟨s, UInt64.le_refl _, by omega, memEqAbove_refl s _, (fun hc => by cases hc), h⟩
+        · simp only [↓reduceIte, Bind.bind, SolanaM.bind] at h ⊢
+          cases hms : mulDiv64 markP maxBps BPS_DEN s with
+          | err c st => rw [hms] at h; cases h
+          | ok maxSlip s1 =>
+            rw [hms] at h; dsimp only at h
+            have ⟨_, hmaxSlip, hsp1Le, hsp1Lo, hmem1⟩ := mulDiv64_stack_and_mem (by omega) hms
+            simp only [SolanaM.require, decide_eq_true_eq] at h ⊢
+            by_cases hclamp : diff ≤ maxSlip
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hclamp)] at h
+              dsimp only [SolanaM.pure] at h
+              have hclampNat : diff.toNat ≤ (markP.toNat * maxBps.toNat) / Spec.bpsDenNat := by
+                have := UInt64.le_iff_toNat_le.mp hclamp
+                have hbd : BPS_DEN.toNat = Spec.bpsDenNat := rfl
+                rw [hbd] at hmaxSlip; omega
+              exact ⟨s1, hsp1Le, hsp1Lo, hmem1, (fun _ => hclampNat), h⟩
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hclamp)] at h; dsimp only [SolanaM.fail] at h; cases h
+      obtain ⟨s1, hsp1Le, hsp1Lo, hmem1, hClamp, hPost⟩ := hAfterClamp
+      simp only [Bind.bind, SolanaM.bind] at hPost
+      cases hsp2 : mulDiv64Ceil qty diff POS_SCALE s1 with
+      | err c st => rw [hsp2] at hPost; cases hPost
+      | ok spread s2 =>
+        rw [hsp2] at hPost; dsimp only at hPost
+        have ⟨_, _, _, _, hmem2⟩ := mulDiv64Ceil_stack_and_mem (by omega) hsp2
+        have hmem20 : memEqAbove s2 s s.stackSp :=
+          memEqAbove_trans (memEqAbove_mono hmem2 hsp1Le) hmem1
+        have hmOff : ∀ off : UInt64, off < MktOff.size → s2.mem (mData + off) = s.mem (mData + off) := by
+          intro off hoff
+          have hlt : mData.toNat + off.toNat < 2 ^ 64 := by
+            have := UInt64.lt_iff_toNat_lt.mp hoff; unfold regionValid at hmV; omega
+          exact hmem20 (mData + off) (u64_le_of_add_lt s.stackSp mData off (UInt64.le_iff_toNat_le.mp hmSt) hlt)
+        have hLock2 : ∀ j : UInt64, j < MAX_LEGS →
+            s2.readU64 (legPtrAt fLData j + LegOff.lockedMm) = s.readU64 (legPtrAt fLData j + LegOff.lockedMm) ∧
+            s2.readU64 (legPtrAt fSData j + LegOff.lockedMm) = s.readU64 (legPtrAt fSData j + LegOff.lockedMm) := by
+          intro j hj
+          have ⟨hLa, hLlt⟩ := hLegAddr fLData hLV j hj
+          have ⟨hSa, hSlt⟩ := hLegAddr fSData hSV j hj
+          have hLlo : s.stackSp ≤ legPtrAt fLData j + LegOff.lockedMm :=
+            UInt64.le_iff_toNat_le.mpr (by have := UInt64.le_iff_toNat_le.mp hLSt; omega)
+          have hSlo : s.stackSp ≤ legPtrAt fSData j + LegOff.lockedMm :=
+            UInt64.le_iff_toNat_le.mpr (by have := UInt64.le_iff_toNat_le.mp hSSt; omega)
+          exact ⟨readU64_of_memEqAbove hmem20 hLlo (by omega), readU64_of_memEqAbove hmem20 hSlo (by omega)⟩
+        have hLcap2 : s2.readU64 (fLData + PflOff.capital) = s.readU64 (fLData + PflOff.capital) := by
+          have hlt : (fLData + PflOff.capital).toNat + 8 ≤ 2 ^ 64 := by
+            rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]
+            unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega
+          have hlo : s.stackSp ≤ fLData + PflOff.capital :=
+            u64_le_of_add_lt s.stackSp fLData PflOff.capital (UInt64.le_iff_toNat_le.mp hLSt)
+              (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)
+          exact readU64_of_memEqAbove hmem20 hlo hlt
+        have hScap2 : s2.readU64 (fSData + PflOff.capital) = s.readU64 (fSData + PflOff.capital) := by
+          have hlt : (fSData + PflOff.capital).toNat + 8 ≤ 2 ^ 64 := by
+            rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
+            unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega
+          have hlo : s.stackSp ≤ fSData + PflOff.capital :=
+            u64_le_of_add_lt s.stackSp fSData PflOff.capital (UInt64.le_iff_toNat_le.mp hSSt)
+              (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)
+          exact readU64_of_memEqAbove hmem20 hlo hlt
+        have hLptrLt : (fLData + PflOff.capital).toNat + 8 < 2 ^ 64 := by
+          rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]
+          unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega
+        have hSptrLt : (fSData + PflOff.capital).toNat + 8 < 2 ^ 64 := by
+          rw [u64_add_toNat_of_lt _ _ (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
+          unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega
+        have hLSdisj : (fLData + PflOff.capital).toNat + 8 ≤ (fSData + PflOff.capital).toNat ∨
+            (fSData + PflOff.capital).toNat + 8 ≤ (fLData + PflOff.capital).toNat := by
+          rw [u64_add_toNat_of_lt fLData PflOff.capital (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega),
+              u64_add_toNat_of_lt fSData PflOff.capital (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]
+          unfold regionDisjoint at hLS; simp [PflOff.capital, PflOff.size] at *; omega
+        have hLcapOff : (fLData + PflOff.capital).toNat = fLData.toNat + 88 := by
+          rw [u64_add_toNat_of_lt fLData PflOff.capital (by unfold regionValid at hLV; simp [PflOff.capital, PflOff.size] at *; omega)]; rfl
+        have hScapOff : (fSData + PflOff.capital).toNat = fSData.toNat + 88 := by
+          rw [u64_add_toNat_of_lt fSData PflOff.capital (by unfold regionValid at hSV; simp [PflOff.capital, PflOff.size] at *; omega)]; rfl
+        have hCapDisjLock : ∀ (st : SvmState) (vL vS : UInt64) (j : UInt64), j < MAX_LEGS →
+            ((st.writeU64 (fLData + PflOff.capital) vL).writeU64 (fSData + PflOff.capital) vS).readU64
+              (legPtrAt fLData j + LegOff.lockedMm) = st.readU64 (legPtrAt fLData j + LegOff.lockedMm) ∧
+            ((st.writeU64 (fLData + PflOff.capital) vL).writeU64 (fSData + PflOff.capital) vS).readU64
+              (legPtrAt fSData j + LegOff.lockedMm) = st.readU64 (legPtrAt fSData j + LegOff.lockedMm) := by
+          intro st vL vS j hj
+          have hjLt : j.toNat < 8 := UInt64.lt_iff_toNat_lt.mp hj
+          have ⟨hLa, hLlt⟩ := hLegAddr fLData hLV j hj
+          have ⟨hSa, hSlt⟩ := hLegAddr fSData hSV j hj
+          have hLS' : fLData.toNat + 976 ≤ fSData.toNat ∨ fSData.toNat + 976 ≤ fLData.toNat := hLS
+          constructor
+          · rw [readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hLlt (by omega),
+                readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hLlt (by omega)]
+          · rw [readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hSlt (by omega),
+                readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hSlt (by omega)]
+        have hCapDisjLockRev : ∀ (st : SvmState) (vS vL : UInt64) (j : UInt64), j < MAX_LEGS →
+            ((st.writeU64 (fSData + PflOff.capital) vS).writeU64 (fLData + PflOff.capital) vL).readU64
+              (legPtrAt fLData j + LegOff.lockedMm) = st.readU64 (legPtrAt fLData j + LegOff.lockedMm) ∧
+            ((st.writeU64 (fSData + PflOff.capital) vS).writeU64 (fLData + PflOff.capital) vL).readU64
+              (legPtrAt fSData j + LegOff.lockedMm) = st.readU64 (legPtrAt fSData j + LegOff.lockedMm) := by
+          intro st vS vL j hj
+          have hjLt : j.toNat < 8 := UInt64.lt_iff_toNat_lt.mp hj
+          have ⟨hLa, hLlt⟩ := hLegAddr fLData hLV j hj
+          have ⟨hSa, hSlt⟩ := hLegAddr fSData hSV j hj
+          have hLS' : fLData.toNat + 976 ≤ fSData.toNat ∨ fSData.toNat + 976 ≤ fLData.toNat := hLS
+          constructor
+          · rw [readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hLlt (by omega),
+                readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hLlt (by omega)]
+          · rw [readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hSlt (by omega),
+                readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hSlt (by omega)]
+        by_cases hspPos : spread > 0
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true hspPos)] at hPost
+          by_cases hgt : execPrice > markP
+          · rw [ite_eq_left_of_eq_true _ _ (eq_true hgt)] at hPost
+            unfold loadU64 rawLoadU64 SolanaM.require at hPost
+            simp only [SolanaM.bind, decide_eq_true_eq] at hPost
+            let cL := s2.readU64 (fLData + PflOff.capital)
+            by_cases hgeL : cL ≥ spread
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hgeL)] at hPost
+              dsimp only [SolanaM.pure, storeU64, rawStoreU64] at hPost
+              have ⟨haddLt, hs'⟩ := addU64At_ok_spec fSData PflOff.capital spread (s2.writeU64 (fLData + PflOff.capital) (cL - spread)) s' hPost
+              subst hs'
+              have hSread : (s2.writeU64 (fLData + PflOff.capital) (cL - spread)).readU64 (fSData + PflOff.capital) =
+                  s2.readU64 (fSData + PflOff.capital) :=
+                readU64_writeU64_of_disjNat s2 _ _ _ hLptrLt hSptrLt hLSdisj
+              rw [hSread] at haddLt ⊢
+              have hLfin : ((s2.writeU64 (fLData + PflOff.capital) (cL - spread)).writeU64 (fSData + PflOff.capital) (s2.readU64 (fSData + PflOff.capital) + spread)).readU64 (fLData + PflOff.capital) = cL - spread := by
+                rw [readU64_writeU64_of_disjNat _ _ _ _ hSptrLt hLptrLt hLSdisj.symm, SvmState.readU64_writeU64_same]
+              have hSfin : ((s2.writeU64 (fLData + PflOff.capital) (cL - spread)).writeU64 (fSData + PflOff.capital) (s2.readU64 (fSData + PflOff.capital) + spread)).readU64 (fSData + PflOff.capital) =
+                  s2.readU64 (fSData + PflOff.capital) + spread := SvmState.readU64_writeU64_same _ _ _
+              refine ⟨?_, fun hc _ => hClamp hc, ?_, fun j hj => ?_⟩
+              · rw [hLfin, hSfin, u64_sub_toNat_of_le cL spread (UInt64.le_iff_toNat_le.mp hgeL),
+                    u64_add_toNat_of_lt _ _ haddLt]
+                have hcL : cL = s.readU64 (fLData + PflOff.capital) := hLcap2
+                rw [hcL, hScap2]
+                have := UInt64.le_iff_toNat_le.mp hgeL; rw [hcL] at this; omega
+              · intro off hoff
+                have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
+                have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
+                  u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
+                have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
+                  rw [hmAdd, hScapOff]; unfold regionDisjoint at hMS; simp [MktOff.size, PflOff.size] at *; omega
+                have hMLd : (mData + off).toNat < (fLData + PflOff.capital).toNat ∨ (fLData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
+                  rw [hmAdd, hLcapOff]; unfold regionDisjoint at hML; simp [MktOff.size, PflOff.size] at *; omega
+                have e1 := readU8_writeU64_of_disjNat (s2.writeU64 (fLData + PflOff.capital) (cL - spread)) (fSData + PflOff.capital) (mData + off) (s2.readU64 (fSData + PflOff.capital) + spread) hSptrLt hMSd
+                have e2 := readU8_writeU64_of_disjNat s2 (fLData + PflOff.capital) (mData + off) (cL - spread) hLptrLt hMLd
+                exact (e1.trans e2).trans (hmOff off hoff)
+              · have ⟨eL, eS⟩ := hCapDisjLock s2 (cL - spread) (s2.readU64 (fSData + PflOff.capital) + spread) j hj
+                have ⟨eL2, eS2⟩ := hLock2 j hj
+                exact ⟨eL.trans eL2, eS.trans eS2⟩
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hgeL)] at hPost; dsimp only [SolanaM.fail] at hPost; cases hPost
+          · rw [ite_eq_right_of_eq_false _ _ (eq_false hgt)] at hPost
+            unfold loadU64 rawLoadU64 SolanaM.require at hPost
+            simp only [SolanaM.bind, decide_eq_true_eq] at hPost
+            let cS := s2.readU64 (fSData + PflOff.capital)
+            by_cases hgeS : cS ≥ spread
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hgeS)] at hPost
+              dsimp only [SolanaM.pure, storeU64, rawStoreU64] at hPost
+              have ⟨haddLt, hs'⟩ := addU64At_ok_spec fLData PflOff.capital spread (s2.writeU64 (fSData + PflOff.capital) (cS - spread)) s' hPost
+              subst hs'
+              have hLread : (s2.writeU64 (fSData + PflOff.capital) (cS - spread)).readU64 (fLData + PflOff.capital) =
+                  s2.readU64 (fLData + PflOff.capital) :=
+                readU64_writeU64_of_disjNat s2 _ _ _ hSptrLt hLptrLt hLSdisj.symm
+              rw [hLread] at haddLt ⊢
+              have hSfin : ((s2.writeU64 (fSData + PflOff.capital) (cS - spread)).writeU64 (fLData + PflOff.capital) (s2.readU64 (fLData + PflOff.capital) + spread)).readU64 (fSData + PflOff.capital) = cS - spread := by
+                rw [readU64_writeU64_of_disjNat _ _ _ _ hLptrLt hSptrLt hLSdisj, SvmState.readU64_writeU64_same]
+              have hLfin : ((s2.writeU64 (fSData + PflOff.capital) (cS - spread)).writeU64 (fLData + PflOff.capital) (s2.readU64 (fLData + PflOff.capital) + spread)).readU64 (fLData + PflOff.capital) =
+                  s2.readU64 (fLData + PflOff.capital) + spread := SvmState.readU64_writeU64_same _ _ _
+              refine ⟨?_, fun hc _ => hClamp hc, ?_, fun j hj => ?_⟩
+              · rw [hLfin, hSfin, u64_sub_toNat_of_le cS spread (UInt64.le_iff_toNat_le.mp hgeS),
+                    u64_add_toNat_of_lt _ _ haddLt]
+                have hcS : cS = s.readU64 (fSData + PflOff.capital) := hScap2
+                rw [hcS, hLcap2]
+                have := UInt64.le_iff_toNat_le.mp hgeS; rw [hcS] at this; omega
+              · intro off hoff
+                have hoffLt : off.toNat < 400 := UInt64.lt_iff_toNat_lt.mp hoff
+                have hmAdd : (mData + off).toNat = mData.toNat + off.toNat :=
+                  u64_add_toNat_of_lt _ _ (by unfold regionValid at hmV; simp [MktOff.size] at *; omega)
+                have hMSd : (mData + off).toNat < (fSData + PflOff.capital).toNat ∨ (fSData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
+                  rw [hmAdd, hScapOff]; unfold regionDisjoint at hMS; simp [MktOff.size, PflOff.size] at *; omega
+                have hMLd : (mData + off).toNat < (fLData + PflOff.capital).toNat ∨ (fLData + PflOff.capital).toNat + 8 ≤ (mData + off).toNat := by
+                  rw [hmAdd, hLcapOff]; unfold regionDisjoint at hML; simp [MktOff.size, PflOff.size] at *; omega
+                have e1 := readU8_writeU64_of_disjNat (s2.writeU64 (fSData + PflOff.capital) (cS - spread)) (fLData + PflOff.capital) (mData + off) (s2.readU64 (fLData + PflOff.capital) + spread) hLptrLt hMLd
+                have e2 := readU8_writeU64_of_disjNat s2 (fSData + PflOff.capital) (mData + off) (cS - spread) hSptrLt hMSd
+                exact (e1.trans e2).trans (hmOff off hoff)
+              · have ⟨eL, eS⟩ := hCapDisjLockRev s2 (cS - spread) (s2.readU64 (fLData + PflOff.capital) + spread) j hj
+                have ⟨eL2, eS2⟩ := hLock2 j hj
+                exact ⟨eL.trans eL2, eS.trans eS2⟩
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hgeS)] at hPost; dsimp only [SolanaM.fail] at hPost; cases hPost
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false hspPos)] at hPost
+          dsimp only [Pure.pure, SolanaM.pure] at hPost; cases hPost
+          exact ⟨by rw [hLcap2, hScap2], fun hc _ => hClamp hc, hmOff, hLock2⟩
 
 /-- Helper: writing any `UInt64` outside `dData` preserves `dexStockExact` and `vaultBalance`. -/
 private theorem dexStockExact_writeU64_outside {s : SvmState} {dData addr v : UInt64}
@@ -3433,165 +3530,65 @@ theorem findOrAllocLegSlot_preserves_legCount_bound
     · have hdec : decide (empty < MAX_LEGS) = false := decide_eq_false hlt
       rw [hdec] at hreq; simp only [Bool.false_eq_true, ↓reduceIte, SolanaM.fail] at hreq; cases hreq
 
-/-- **Refinement #19 (`handleLiquidate` Insurance-Draw Core: Firewall `freeCap == 0 && legLock == 0` Guard + Exact Cap + Stock Equality)**:
-    Directly on `SvmState.mem`, the exact insurance-draw block of `Program.handleLiquidate`:
-    1. Preserves `dexStockExact s' dData` and `vaultBalance` bit-for-bit!
-    2. Whenever `freeCap ≠ 0 ∨ legLock ≠ 0`, leaves state **BIT-FOR-BIT UNCHANGED (`s' = s`)**!
-    3. Whenever `insDraw` is drawn, `ins_before - ins_after ≤ ⌊ins_before * maxInsDrawBps / 10000⌋`! -/
-theorem liquidateInsDrawCore_bounds_and_stock
-    (dData mData : Ptr) (shortfall freeCap legLock : UInt64) (s s' : SvmState)
-    (hsp : 8 ≤ s.stackSp.toNat)
-    (hdV : regionValid dData DexOff.size)
-    (hmV : regionValid mData MktOff.size)
-    (hdSt : s.stackSp ≤ dData) (hmSt : s.stackSp ≤ mData)
-    (hDM : regionDisjoint dData DexOff.size mData MktOff.size)
-    (hStock : dexStockExact s dData)
-    (h : (do
-        if shortfall > 0 && freeCap == 0 && legLock == 0 then
-          let ins ← loadU64 mData MktOff.insurance
-          let maxDraw ← mulDiv64 ins (← loadU64 mData MktOff.maxInsDrawBps) BPS_DEN
-          let draw1 := if shortfall < maxDraw then shortfall else maxDraw
-          let insDraw := if draw1 < ins then draw1 else ins
-          if insDraw > 0 then
-            subU64At mData MktOff.insurance      insDraw
-            subU64At dData DexOff.totalInsurance insDraw
-            addU64At mData MktOff.realizedPool   insDraw
-            addU64At dData DexOff.totalResidual  insDraw) s = .ok () s') :
-    dexStockExact s' dData ∧
-    s'.readU64 (dData + DexOff.vaultBalance) = s.readU64 (dData + DexOff.vaultBalance) ∧
-    ((freeCap ≠ 0 ∨ legLock ≠ 0) → s' = s) ∧
-    (s.readU64 (mData + MktOff.insurance)).toNat - (s'.readU64 (mData + MktOff.insurance)).toNat ≤
-      ((s.readU64 (mData + MktOff.insurance)).toNat * (s.readU64 (mData + MktOff.maxInsDrawBps)).toNat) / Spec.bpsDenNat := by
-  have hd208 : dData.toNat + 208 < 2 ^ 64 := hdV
-  have hm400 : mData.toNat + 400 < 2 ^ 64 := hmV
-  have hDM' : dData.toNat + 208 ≤ mData.toNat ∨ mData.toNat + 400 ≤ dData.toNat := hDM
-  by_cases hcond : (decide (shortfall > 0) && (freeCap == 0) && (legLock == 0)) = true
-  · rw [ite_eq_left_of_eq_true _ _ (eq_true hcond)] at h
-    have h12 := (Bool.and_eq_true _ _).mp hcond
-    have hcap0 : freeCap = 0 := beq_iff_eq.mp ((Bool.and_eq_true _ _).mp h12.1).2
-    have hlock0 : legLock = 0 := beq_iff_eq.mp h12.2
-    simp only [loadU64, rawLoadU64, Bind.bind, SolanaM.bind] at h
-    let ins := s.readU64 (mData + MktOff.insurance)
-    let maxBps := s.readU64 (mData + MktOff.maxInsDrawBps)
-    cases hmd : mulDiv64 ins maxBps BPS_DEN s with
-    | err c st => rw [hmd] at h; cases h
-    | ok maxDraw s1 =>
-      rw [hmd] at h; dsimp only at h
-      have ⟨_, hmaxDraw, _, _, hmem1⟩ := mulDiv64_stack_and_mem hsp hmd
-      have hbd : BPS_DEN.toNat = Spec.bpsDenNat := rfl
-      rw [hbd] at hmaxDraw
-      have hD1 : ∀ off : UInt64, off.toNat + 8 ≤ 208 → s1.readU64 (dData + off) = s.readU64 (dData + off) := fun off hoff =>
-        readU64_of_memEqAbove hmem1
-          (u64_le_of_add_lt _ _ _ (UInt64.le_iff_toNat_le.mp hdSt) (by omega))
-          (by rw [u64_add_toNat_of_lt _ _ (by omega)]; omega)
-      have hM1 : ∀ off : UInt64, off.toNat + 8 ≤ 400 → s1.readU64 (mData + off) = s.readU64 (mData + off) := fun off hoff =>
-        readU64_of_memEqAbove hmem1
-          (u64_le_of_add_lt _ _ _ (UInt64.le_iff_toNat_le.mp hmSt) (by omega))
-          (by rw [u64_add_toNat_of_lt _ _ (by omega)]; omega)
-      have hSt1 : dexStockExact s1 dData := by
-        unfold dexStockExact at hStock ⊢
-        rw [hD1 DexOff.totalCapital (by decide), hD1 DexOff.totalInsurance (by decide),
-            hD1 DexOff.totalResidual (by decide), hD1 DexOff.totalSurplus (by decide),
-            hD1 DexOff.totalRewards (by decide), hD1 DexOff.vaultBalance (by decide)]
-        exact hStock
-      let draw1 := if shortfall < maxDraw then shortfall else maxDraw
-      let insDraw := if draw1 < ins then draw1 else ins
-      have hDrawLeMax : insDraw.toNat ≤ maxDraw.toNat := by
-        have hd1 : draw1.toNat ≤ maxDraw.toNat := by
-          show (if shortfall < maxDraw then shortfall else maxDraw).toNat ≤ maxDraw.toNat
-          by_cases hlt : shortfall < maxDraw
-          · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
-          · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
-        show (if draw1 < ins then draw1 else ins).toNat ≤ maxDraw.toNat
-        by_cases hlt : draw1 < ins
-        · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; exact hd1
-        · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]
-          have := UInt64.le_iff_toNat_le.mp (UInt64.not_lt.mp hlt); omega
-      by_cases hpos : insDraw > 0
-      · rw [ite_eq_left_of_eq_true _ _ (eq_true hpos)] at h
-        obtain ⟨_, s2, h1, h⟩ := bind_ok_elim h
-        obtain ⟨_, s3, h2, h⟩ := bind_ok_elim h
-        obtain ⟨_, s4, h3, h4⟩ := bind_ok_elim h
-        have ⟨hmiLe, hs2⟩ := subU64At_ok_spec _ _ _ _ _ h1
-        have ⟨hdiLe, hs3⟩ := subU64At_ok_spec _ _ _ _ _ h2
-        have ⟨_, hs4⟩ := addU64At_ok_spec _ _ _ _ _ h3
-        have ⟨hdrLt, hs'⟩ := addU64At_ok_spec _ _ _ _ _ h4
-        have hMout : ∀ (st : SvmState) (off v : UInt64), off.toNat + 8 ≤ 400 →
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.vaultBalance) = st.readU64 (dData + DexOff.vaultBalance) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalCapital) = st.readU64 (dData + DexOff.totalCapital) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalInsurance) = st.readU64 (dData + DexOff.totalInsurance) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalResidual) = st.readU64 (dData + DexOff.totalResidual) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalSurplus) = st.readU64 (dData + DexOff.totalSurplus) ∧
-            (st.writeU64 (mData + off) v).readU64 (dData + DexOff.totalRewards) = st.readU64 (dData + DexOff.totalRewards) := by
-          intro st off v hoff
-          have ha := u64_add_toNat_of_lt mData off (by omega)
-          have hds : DexOff.size.toNat = 208 := rfl
-          exact dexStockExact_writeU64_outside (s := st) (v := v) hdV (by omega) (by omega)
-        have hDoutM : ∀ (st : SvmState) (doff v : UInt64), doff.toNat + 8 ≤ 208 →
-            (st.writeU64 (dData + doff) v).readU64 (mData + MktOff.insurance) = st.readU64 (mData + MktOff.insurance) := by
-          intro st doff v hdoff
-          have hmI : MktOff.insurance.toNat = 224 := rfl
-          have ha := u64_add_toNat_of_lt dData doff (by omega)
-          have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
-          exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
-        have hDoutD : ∀ (st : SvmState) (o1 o2 v : UInt64), o1.toNat + 8 ≤ 208 → o2.toNat + 8 ≤ 208 →
-            (o1.toNat + 8 ≤ o2.toNat ∨ o2.toNat + 8 ≤ o1.toNat) →
-            (st.writeU64 (dData + o1) v).readU64 (dData + o2) = st.readU64 (dData + o2) := by
-          intro st o1 o2 v h1' h2' hdj
-          have ha := u64_add_toNat_of_lt dData o1 (by omega)
-          have hb := u64_add_toNat_of_lt dData o2 (by omega)
-          exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
-        have hMRoutMI : ∀ (st : SvmState) (v : UInt64),
-            (st.writeU64 (mData + MktOff.realizedPool) v).readU64 (mData + MktOff.insurance) = st.readU64 (mData + MktOff.insurance) := by
-          intro st v
-          have hmR : MktOff.realizedPool.toNat = 216 := rfl
-          have hmI : MktOff.insurance.toNat = 224 := rfl
-          have ha := u64_add_toNat_of_lt mData MktOff.realizedPool (by omega)
-          have hb := u64_add_toNat_of_lt mData MktOff.insurance (by omega)
-          exact readU64_writeU64_of_disjNat _ _ _ _ (by omega) (by omega) (by omega)
-        have ⟨eV1, eC1, eI1, eR1, eS1, eRw1⟩ := hMout s1 MktOff.insurance (s1.readU64 (mData + MktOff.insurance) - insDraw) (by decide)
-        have ⟨eV3, eC3, eI3, eR3, eS3, eRw3⟩ := hMout s3 MktOff.realizedPool (s3.readU64 (mData + MktOff.realizedPool) + insDraw) (by decide)
-        subst hs2; subst hs3; subst hs4; subst hs'
-        refine ⟨?_, ?_, fun hne => hne.elim (absurd hcap0) (absurd hlock0), ?_⟩
-        · unfold dexStockExact at hSt1 ⊢
-          rw [SvmState.readU64_writeU64_same, u64_add_toNat_of_lt _ _ hdrLt,
-              hDoutD _ DexOff.totalResidual DexOff.totalCapital _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalResidual DexOff.totalInsurance _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalResidual DexOff.totalSurplus _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalResidual DexOff.totalRewards _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalResidual DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eC3, eI3, eR3, eS3, eRw3, eV3,
-              SvmState.readU64_writeU64_same, u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hdiLe),
-              hDoutD _ DexOff.totalInsurance DexOff.totalCapital _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalInsurance DexOff.totalResidual _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalInsurance DexOff.totalSurplus _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalInsurance DexOff.totalRewards _ (by decide) (by decide) (by decide),
-              hDoutD _ DexOff.totalInsurance DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eC1, eI1, eR1, eS1, eRw1, eV1]
-          have hleI : (if (if shortfall < maxDraw then shortfall else maxDraw) < s.readU64 (mData + MktOff.insurance)
-              then if shortfall < maxDraw then shortfall else maxDraw else s.readU64 (mData + MktOff.insurance)).toNat
-              ≤ (s1.readU64 (dData + DexOff.totalInsurance)).toNat := by
-            rw [← eI1]; exact UInt64.le_iff_toNat_le.mp hdiLe
-          omega
-        · rw [hDoutD _ DexOff.totalResidual DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eV3, hDoutD _ DexOff.totalInsurance DexOff.vaultBalance _ (by decide) (by decide) (by decide),
-              eV1, hD1 DexOff.vaultBalance (by decide)]
-        · rw [hDoutM _ DexOff.totalResidual _ (by decide), hMRoutMI,
-              hDoutM _ DexOff.totalInsurance _ (by decide), SvmState.readU64_writeU64_same,
-              u64_sub_toNat_of_le _ _ (UInt64.le_iff_toNat_le.mp hmiLe), hM1 MktOff.insurance (by decide)]
-          have hleIns : insDraw.toNat ≤ ins.toNat := by
-            have h1' : insDraw ≤ s1.readU64 (mData + MktOff.insurance) := hmiLe
-            rw [hM1 MktOff.insurance (by decide)] at h1'
-            exact UInt64.le_iff_toNat_le.mp h1'
-          change ins.toNat - (ins.toNat - insDraw.toNat) ≤ (ins.toNat * maxBps.toNat) / Spec.bpsDenNat
-          rw [← hmaxDraw]; omega
-      · rw [ite_eq_right_of_eq_false _ _ (eq_false hpos)] at h
-        dsimp only [Pure.pure, SolanaM.pure] at h; cases h
-        exact ⟨hSt1, hD1 DexOff.vaultBalance (by decide), fun hne => hne.elim (absurd hcap0) (absurd hlock0),
-               by rw [hM1 MktOff.insurance (by decide), Nat.sub_self]; exact Nat.zero_le _⟩
-  · rw [ite_eq_right_of_eq_false _ _ (eq_false hcond)] at h
-    dsimp only [Pure.pure, SolanaM.pure] at h; cases h
-    exact ⟨hStock, rfl, fun _ => rfl, by rw [Nat.sub_self]; exact Nat.zero_le _⟩
+/-- **Refinement #19 (`realizeWinnerPnl` Outage-Ramp Auto-Pause Directly on `Program.realizeWinnerPnl`)**:
+    Directly on the compiled `Program.realizeWinnerPnl` (ZERO copy-pasted snippet!):
+    Whenever a market is in a saturated outage catch-up ramp (`rampSlot ≠ 0 ∧ rampSlot ≤ curSlot ∧
+    curSlot - rampSlot ≤ RAMP_FRONT_COOLDOWN`) and `realizedPool < totalPosPnl` (unbacked PnL,
+    `forceHaircut = false`), `Program.realizeWinnerPnl` **UNCONDITIONALLY PAUSES NEW `I_m` FRONTING**:
+    `s' = s ∧ rem = posPnl` (`MktOff.insurance`, `MktOff.insFronted`, `DexOff.totalInsurance` are
+    BIT-FOR-BIT UNCHANGED!). -/
+theorem realizeWinnerPnl_ramp_pauses_fronting
+    (dData mData fData : Ptr) (posPnl curSlot rem : UInt64) (s s' : SvmState)
+    (hPos : posPnl ≠ 0)
+    (hUnbacked : s.readU64 (mData + MktOff.realizedPool) < s.readU64 (mData + MktOff.totalPosPnl))
+    (hRampNz : s.readU64 (mData + MktOff.lastRampSlot) ≠ 0)
+    (hGe : s.readU64 (mData + MktOff.lastRampSlot) ≤ curSlot)
+    (hCool : curSlot - s.readU64 (mData + MktOff.lastRampSlot) ≤ RAMP_FRONT_COOLDOWN)
+    (h : realizeWinnerPnl dData mData fData posPnl curSlot false s = .ok rem s') :
+    s' = s ∧ rem = posPnl := by
+  unfold realizeWinnerPnl at h
+  have hp0 : (posPnl == 0) = false := beq_false_of_ne hPos
+  rw [ite_eq_right_of_eq_false _ _ (eq_false (by rw [hp0]; decide))] at h
+  unfold loadU64 loadU16 loadU8 rawLoadU64 rawLoadU16 rawLoadU8 at h
+  simp only [Bind.bind, SolanaM.bind] at h
+  have hNotGe : ¬ (s.readU64 (mData + MktOff.realizedPool) ≥ s.readU64 (mData + MktOff.totalPosPnl)) := by
+    intro hge
+    have h1 := UInt64.lt_iff_toNat_lt.mp hUnbacked
+    have h2 := UInt64.le_iff_toNat_le.mp hge
+    omega
+  have hBr1 : ((decide (s.readU64 (mData + MktOff.realizedPool) ≥ s.readU64 (mData + MktOff.totalPosPnl)) &&
+      decide (s.readU64 (mData + MktOff.totalPosPnl) > 0)) || false) = false := by
+    simp [hNotGe]
+  rw [ite_eq_right_of_eq_false _ _ (eq_false (by rw [hBr1]; decide))] at h
+  dsimp only [SolanaM.bind] at h
+  have hRampEq0 : (s.readU64 (mData + MktOff.lastRampSlot) == 0) = false := beq_false_of_ne hRampNz
+  have hNotLt : ¬ (curSlot < s.readU64 (mData + MktOff.lastRampSlot)) := by
+    intro hlt
+    have h1 := UInt64.lt_iff_toNat_lt.mp hlt
+    have h2 := UInt64.le_iff_toNat_le.mp hGe
+    omega
+  have hNotGt : ¬ (curSlot - s.readU64 (mData + MktOff.lastRampSlot) > RAMP_FRONT_COOLDOWN) := by
+    intro hgt
+    have h1 := UInt64.lt_iff_toNat_lt.mp hgt
+    have h2 := UInt64.le_iff_toNat_le.mp hCool
+    omega
+  have hNotRamp : ((s.readU64 (mData + MktOff.lastRampSlot) == 0) ||
+      decide (curSlot < s.readU64 (mData + MktOff.lastRampSlot)) ||
+      decide (curSlot - s.readU64 (mData + MktOff.lastRampSlot) > RAMP_FRONT_COOLDOWN)) = false := by
+    simp [hRampEq0, hNotLt, hNotGt]
+  have hCondF : (decide (s.readU16 (mData + MktOff.maxFrontBps) > 0) &&
+      decide (s.readU64 (mData + MktOff.totalPosPnl) > 0) &&
+      ((s.readU64 (mData + MktOff.lastRampSlot) == 0) ||
+        decide (curSlot < s.readU64 (mData + MktOff.lastRampSlot)) ||
+        decide (curSlot - s.readU64 (mData + MktOff.lastRampSlot) > RAMP_FRONT_COOLDOWN)) &&
+      (s.readU8 (mData + MktOff.status) == STATUS_ACTIVE) &&
+      (s.readU64 (mData + MktOff.adlLong) == ADL_ONE) &&
+      (s.readU64 (mData + MktOff.adlShort) == ADL_ONE)) = false := by
+    rw [hNotRamp]; simp
+  rw [ite_eq_right_of_eq_false _ _ (eq_false (by rw [hCondF]; decide))] at h
+  dsimp only [Pure.pure, SolanaM.pure] at h
+  cases h
+  exact ⟨rfl, rfl⟩
 
 /-- **Refinement #20 (`handleDepositInsurance` Optimistic-NAV Share Mint Core Refines `hardenedInsMint`)**:
     Directly on `SvmState.mem`, the exact share-minting core of `Program.handleDepositInsurance`
@@ -3790,118 +3787,124 @@ theorem matcherQuoteCore_refines_spec
             have hleNat : ¬ (markP.toNat > delta.toNat) := fun hg => hgt (UInt64.lt_iff_toNat_lt.mpr hg)
             rw [ite_eq_right_of_eq_false _ _ (eq_false hleNat)]; rfl
 
-/-- **Refinement #22b (`OracleAdapter.handleCrank` Clamped Step + Funding Core Satisfies Core Clamp)**:
-    Directly on `SvmState.mem`, the exact `UInt64` price-clamping and funding-budget arithmetic of
-    `Percolator.OracleAdapter.handleCrank` ALWAYS obeys `percolator::UpdateOracle`'s per-slot clamp
-    `|newP - oldP| + fundE6 ≤ ⌊oldP * maxMoveBps / 10000⌋`! -/
-theorem oracleClampedStepCore_refines_spec
-    (oldP feedPrice maxMoveBps fundBps : UInt64) (newP fundE6 : UInt64) (s s' : SvmState)
+/-- **Refinement #22b (`OracleAdapter.computeCrankStep` Directly Refines `Program.handleUpdateOracle` Clamp & Fast-Snap)**:
+    Directly on the compiled `OracleAdapter.computeCrankStep` (ZERO copy-pasted `do`-block!):
+    1. When `isEmpty = true`: snaps straight to `newP = feedPrice` with `fundE6 = 0` in 1 slot!
+    2. When `isEmpty = false`: enforces the EXACT `dt == 1` half-step pacing (`effMaxMove = if curSlot == lastSlot + 1 ∧ rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove`)
+       and guarantees `|newP - oldP| + fundE6 ≤ ⌊oldP * effMaxMove / 10_000⌋` in lockstep with `Program.handleUpdateOracle`! -/
+theorem oracleComputeCrankStep_refines_spec
+    (oldP feedPrice rawMaxMove fundBps curSlot lastSlot : UInt64) (isEmpty : Bool)
+    (newP : UInt64) (fundSign : UInt8) (fundE6 : UInt64) (s s' : SvmState)
     (hsp : 16 ≤ s.stackSp.toNat)
     (hOldPos : 1 ≤ oldP.toNat)
-    (hOldAdd : oldP.toNat + (oldP.toNat * maxMoveBps.toNat) / 10_000 < 2 ^ 64)
-    (h : (do
-        let maxAllowed ← mulDiv64 oldP maxMoveBps BPS_DEN
-        let (np, step) : UInt64 × UInt64 :=
-          if feedPrice >= oldP then
-            let raw := feedPrice - oldP
-            let stp := if raw < maxAllowed then raw else maxAllowed
-            (oldP + stp, stp)
-          else
-            let raw := oldP - feedPrice
-            let stp := if raw < maxAllowed then raw else maxAllowed
-            if oldP > stp then (oldP - stp, stp) else (1, oldP - 1)
-        let remBudget := if maxAllowed >= step then maxAllowed - step else 0
-        let f ← if feedPrice != oldP && remBudget > 0 && fundBps > 0 then do
-            let rawF ← mulDiv64 oldP fundBps BPS_DEN
-            pure (if rawF < remBudget then rawF else remBudget)
-          else pure 0
-        pure (np, f)) s = .ok (newP, fundE6) s') :
+    (hOldAdd : oldP.toNat + (oldP.toNat * rawMaxMove.toNat) / 10_000 < 2 ^ 64)
+    (h : OracleAdapter.computeCrankStep oldP feedPrice rawMaxMove fundBps curSlot lastSlot isEmpty s =
+         .ok (newP, fundSign, fundE6) s') :
+    let effMaxMove := if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
     let diff := if newP.toNat ≥ oldP.toNat then newP.toNat - oldP.toNat else oldP.toNat - newP.toNat
-    diff + fundE6.toNat ≤ (oldP.toNat * maxMoveBps.toNat) / 10_000 := by
-  simp only [Bind.bind, SolanaM.bind] at h
-  cases hma : mulDiv64 oldP maxMoveBps BPS_DEN s with
-  | err c st => rw [hma] at h; cases h
-  | ok maxAllowed s1 =>
-    rw [hma] at h; dsimp only at h
-    have ⟨_, hmaNat, _, hsp1Lo, _⟩ := mulDiv64_stack_and_mem (by omega) hma
-    have hbd : BPS_DEN.toNat = 10_000 := rfl
-    rw [hbd] at hmaNat
-    let pair : UInt64 × UInt64 :=
-      if feedPrice >= oldP then
-        let raw := feedPrice - oldP
-        let stp := if raw < maxAllowed then raw else maxAllowed
-        (oldP + stp, stp)
-      else
-        let raw := oldP - feedPrice
-        let stp := if raw < maxAllowed then raw else maxAllowed
-        if oldP > stp then (oldP - stp, stp) else (1, oldP - 1)
-    have hstepBound :
-        (if pair.1.toNat ≥ oldP.toNat then pair.1.toNat - oldP.toNat else oldP.toNat - pair.1.toNat) = pair.2.toNat ∧
-        pair.2.toNat ≤ maxAllowed.toNat := by
-      dsimp only [pair]
-      by_cases hge : feedPrice ≥ oldP
-      · simp only [hge, ↓reduceIte]
-        let raw := feedPrice - oldP
-        let stp := if raw < maxAllowed then raw else maxAllowed
-        have hstpLe : stp.toNat ≤ maxAllowed.toNat := by
-          show (if raw < maxAllowed then raw else maxAllowed).toNat ≤ maxAllowed.toNat
-          by_cases hlt : raw < maxAllowed
-          · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
-          · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
-        have hadd := u64_add_toNat_of_lt oldP stp (by omega)
-        change (if (oldP + stp).toNat ≥ oldP.toNat then (oldP + stp).toNat - oldP.toNat else oldP.toNat - (oldP + stp).toNat) = stp.toNat ∧ stp.toNat ≤ maxAllowed.toNat
-        rw [hadd]; refine ⟨?_, hstpLe⟩; split <;> omega
-      · simp only [hge, ↓reduceIte]
-        let raw := oldP - feedPrice
-        let stp := if raw < maxAllowed then raw else maxAllowed
-        have hstpLe : stp.toNat ≤ maxAllowed.toNat := by
-          show (if raw < maxAllowed then raw else maxAllowed).toNat ≤ maxAllowed.toNat
-          by_cases hlt : raw < maxAllowed
-          · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
-          · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
-        change (let p := if oldP > stp then (oldP - stp, stp) else (1, oldP - 1);
-          (if p.1.toNat ≥ oldP.toNat then p.1.toNat - oldP.toNat else oldP.toNat - p.1.toNat) = p.2.toNat ∧ p.2.toNat ≤ maxAllowed.toNat)
-        dsimp only
-        by_cases hgt : oldP > stp
-        · rw [ite_eq_left_of_eq_true _ _ (eq_true hgt)]
-          have hgtNat : stp.toNat < oldP.toNat := UInt64.lt_iff_toNat_lt.mp hgt
-          have hsub := u64_sub_toNat_of_le oldP stp (by omega)
-          dsimp only; rw [hsub]; refine ⟨?_, hstpLe⟩; split <;> omega
-        · rw [ite_eq_right_of_eq_false _ _ (eq_false hgt)]
-          have hleNat : oldP.toNat ≤ stp.toNat := Nat.le_of_not_lt (fun hg => hgt (UInt64.lt_iff_toNat_lt.mpr hg))
-          have h1 : (1 : UInt64).toNat = 1 := rfl
-          have hsub := u64_sub_toNat_of_le oldP 1 (by omega)
-          dsimp only; rw [h1, hsub]; refine ⟨?_, by omega⟩; split <;> omega
-    let np := pair.1
-    let step := pair.2
-    have ⟨hdiffEq, hstpLe⟩ := hstepBound
-    let remBudget := if maxAllowed ≥ step then maxAllowed - step else 0
-    have hremNat : remBudget.toNat = maxAllowed.toNat - step.toNat := by
-      show (if maxAllowed ≥ step then maxAllowed - step else 0).toNat = _
-      have hge : maxAllowed ≥ step := UInt64.le_iff_toNat_le.mpr hstpLe
-      rw [ite_eq_left_of_eq_true _ _ (eq_true hge), u64_sub_toNat_of_le _ _ hstpLe]
-    by_cases hfc : ((feedPrice != oldP) && decide (remBudget > 0) && decide (fundBps > 0)) = true
-    · rw [ite_eq_left_of_eq_true _ _ (eq_true hfc)] at h
-      unfold SolanaM.bind at h
-      cases hrf : mulDiv64 oldP fundBps BPS_DEN s1 with
-      | err c st => rw [hrf] at h; cases h
-      | ok rawF s2 =>
-        rw [hrf] at h; dsimp only [Bind.bind, Pure.pure, SolanaM.pure, SolanaM.bind] at h; cases h
-        have hfLe : (if rawF < remBudget then rawF else remBudget).toNat ≤ remBudget.toNat := by
-          by_cases hlt : rawF < remBudget
-          · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
-          · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
-        dsimp only
-        rw [hdiffEq]
-        change step.toNat + (if rawF < remBudget then rawF else remBudget).toNat ≤ (oldP.toNat * maxMoveBps.toNat) / 10_000
-        have hstEq : pair.2.toNat = step.toNat := rfl
-        omega
-    · rw [ite_eq_right_of_eq_false _ _ (eq_false hfc)] at h
-      dsimp only [Bind.bind, Pure.pure, SolanaM.pure, SolanaM.bind] at h; cases h
-      dsimp only
-      rw [hdiffEq]
-      have h0 : (0 : UInt64).toNat = 0 := rfl
+    (isEmpty = true → newP = feedPrice ∧ fundE6 = 0) ∧
+    (isEmpty = false → diff + fundE6.toNat ≤ (oldP.toNat * effMaxMove.toNat) / 10_000) := by
+  unfold OracleAdapter.computeCrankStep at h
+  cases isEmpty
+  · simp only [Bool.false_eq_true, ↓reduceIte, Bind.bind, SolanaM.bind] at h
+    let effMaxMove := if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove
+    have heffLe : effMaxMove.toNat ≤ rawMaxMove.toNat := by
+      show (if curSlot == lastSlot + 1 && rawMaxMove > 1 then rawMaxMove >>> 1 else rawMaxMove).toNat ≤ rawMaxMove.toNat
+      by_cases hc : (curSlot == lastSlot + 1 && decide (rawMaxMove > 1)) = true
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hc)]
+        rw [UInt64.toNat_shiftRight]
+        exact Nat.div_le_self _ _
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hc)]; exact Nat.le_refl _
+    have hOldAddEff : oldP.toNat + (oldP.toNat * effMaxMove.toNat) / 10_000 < 2 ^ 64 := by
+      have hm := Nat.mul_le_mul_left oldP.toNat heffLe
+      have hd := Nat.div_le_div_right (c := 10_000) hm
       omega
+    cases hma : mulDiv64 oldP effMaxMove BPS_DEN s with
+    | err c st => rw [hma] at h; cases h
+    | ok maxAllowed s1 =>
+      rw [hma] at h; dsimp only at h
+      have ⟨_, hmaNat, _, hsp1Lo, _⟩ := mulDiv64_stack_and_mem (by omega) hma
+      have hbd : BPS_DEN.toNat = 10_000 := rfl
+      rw [hbd] at hmaNat
+      let pair : UInt64 × UInt64 :=
+        if feedPrice >= oldP then
+          let raw := feedPrice - oldP
+          let stp := if raw < maxAllowed then raw else maxAllowed
+          (oldP + stp, stp)
+        else
+          let raw := oldP - feedPrice
+          let stp := if raw < maxAllowed then raw else maxAllowed
+          if oldP > stp then (oldP - stp, stp) else (1, oldP - 1)
+      have hstepBound :
+          (if pair.1.toNat ≥ oldP.toNat then pair.1.toNat - oldP.toNat else oldP.toNat - pair.1.toNat) = pair.2.toNat ∧
+          pair.2.toNat ≤ maxAllowed.toNat := by
+        dsimp only [pair]
+        by_cases hge : feedPrice ≥ oldP
+        · simp only [hge, ↓reduceIte]
+          let raw := feedPrice - oldP
+          let stp := if raw < maxAllowed then raw else maxAllowed
+          have hstpLe : stp.toNat ≤ maxAllowed.toNat := by
+            show (if raw < maxAllowed then raw else maxAllowed).toNat ≤ maxAllowed.toNat
+            by_cases hlt : raw < maxAllowed
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
+          have hadd := u64_add_toNat_of_lt oldP stp (by omega)
+          change (if (oldP + stp).toNat ≥ oldP.toNat then (oldP + stp).toNat - oldP.toNat else oldP.toNat - (oldP + stp).toNat) = stp.toNat ∧ stp.toNat ≤ maxAllowed.toNat
+          rw [hadd]; refine ⟨?_, hstpLe⟩; split <;> omega
+        · simp only [hge, ↓reduceIte]
+          let raw := oldP - feedPrice
+          let stp := if raw < maxAllowed then raw else maxAllowed
+          have hstpLe : stp.toNat ≤ maxAllowed.toNat := by
+            show (if raw < maxAllowed then raw else maxAllowed).toNat ≤ maxAllowed.toNat
+            by_cases hlt : raw < maxAllowed
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
+          change (let p := if oldP > stp then (oldP - stp, stp) else (1, oldP - 1);
+            (if p.1.toNat ≥ oldP.toNat then p.1.toNat - oldP.toNat else oldP.toNat - p.1.toNat) = p.2.toNat ∧ p.2.toNat ≤ maxAllowed.toNat)
+          dsimp only
+          by_cases hgt : oldP > stp
+          · rw [ite_eq_left_of_eq_true _ _ (eq_true hgt)]
+            have hgtNat : stp.toNat < oldP.toNat := UInt64.lt_iff_toNat_lt.mp hgt
+            have hsub := u64_sub_toNat_of_le oldP stp (by omega)
+            dsimp only; rw [hsub]; refine ⟨?_, hstpLe⟩; split <;> omega
+          · rw [ite_eq_right_of_eq_false _ _ (eq_false hgt)]
+            have hleNat : oldP.toNat ≤ stp.toNat := Nat.le_of_not_lt (fun hg => hgt (UInt64.lt_iff_toNat_lt.mpr hg))
+            have h1 : (1 : UInt64).toNat = 1 := rfl
+            have hsub := u64_sub_toNat_of_le oldP 1 (by omega)
+            dsimp only; rw [h1, hsub]; refine ⟨?_, by omega⟩; split <;> omega
+      let np := pair.1
+      let step := pair.2
+      have ⟨hdiffEq, hstpLe⟩ := hstepBound
+      let remBudget := if maxAllowed ≥ step then maxAllowed - step else 0
+      have hremNat : remBudget.toNat = maxAllowed.toNat - step.toNat := by
+        show (if maxAllowed ≥ step then maxAllowed - step else 0).toNat = _
+        have hge : maxAllowed ≥ step := UInt64.le_iff_toNat_le.mpr hstpLe
+        rw [ite_eq_left_of_eq_true _ _ (eq_true hge), u64_sub_toNat_of_le _ _ hstpLe]
+      refine ⟨(fun hc => by cases hc), fun _ => ?_⟩
+      by_cases hfc : ((feedPrice != oldP) && decide (remBudget > 0) && decide (fundBps > 0)) = true
+      · rw [ite_eq_left_of_eq_true _ _ (eq_true hfc)] at h
+        unfold SolanaM.bind at h
+        cases hrf : mulDiv64 oldP fundBps BPS_DEN s1 with
+        | err c st => rw [hrf] at h; cases h
+        | ok rawF s2 =>
+          rw [hrf] at h; dsimp only [Bind.bind, Pure.pure, SolanaM.pure, SolanaM.bind] at h; cases h
+          have hfLe : (if rawF < remBudget then rawF else remBudget).toNat ≤ remBudget.toNat := by
+            by_cases hlt : rawF < remBudget
+            · rw [ite_eq_left_of_eq_true _ _ (eq_true hlt)]; have := UInt64.lt_iff_toNat_lt.mp hlt; omega
+            · rw [ite_eq_right_of_eq_false _ _ (eq_false hlt)]; exact Nat.le_refl _
+          rw [hdiffEq]
+          change step.toNat + (if rawF < remBudget then rawF else remBudget).toNat ≤ (oldP.toNat * effMaxMove.toNat) / 10_000
+          have hstEq : pair.2.toNat = step.toNat := rfl
+          omega
+      · rw [ite_eq_right_of_eq_false _ _ (eq_false hfc)] at h
+        dsimp only [Bind.bind, Pure.pure, SolanaM.pure, SolanaM.bind] at h; cases h
+        rw [hdiffEq]
+        change step.toNat + (0 : UInt64).toNat ≤ (oldP.toNat * effMaxMove.toNat) / 10_000
+        have hstEq : pair.2.toNat = step.toNat := rfl
+        have h0 : (0 : UInt64).toNat = 0 := rfl
+        omega
+  · simp only [↓reduceIte, Pure.pure, SolanaM.pure] at h; cases h
+    exact ⟨fun _ => ⟨rfl, rfl⟩, fun hc => by cases hc⟩
 
 /-- **Refinement #23 (`handleClaimReward` Accounting Core Preserves 5-Bucket `dexStockExact` & Isolates `C, I, R, S`)**:
     Directly on `SvmState.mem`, the accounting core of `Program.handleClaimReward`:

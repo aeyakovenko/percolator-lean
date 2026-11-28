@@ -67,6 +67,24 @@ inductive SvmAdvStep (dData fData : Ptr) (realSlot : UInt64) : SvmState → SvmS
       (hMF : regionDisjoint mData MktOff.size fData PflOff.size)
       (hExec : syncLegMargins mData fData slotIdx curSlot s = .ok () s') :
       SvmAdvStep dData fData realSlot s s'
+  | spreadAdvL (mData fOther : Ptr) (qty execPrice : UInt64) (clampSpread : Bool) (s s' : SvmState)
+      (hsp : 16 ≤ s.stackSp.toNat)
+      (hmV : regionValid mData MktOff.size) (hfV : regionValid fData PflOff.size) (hoV : regionValid fOther PflOff.size)
+      (hmSt : s.stackSp ≤ mData) (hfSt : s.stackSp ≤ fData) (hoSt : s.stackSp ≤ fOther)
+      (hFO : regionDisjoint fData PflOff.size fOther PflOff.size)
+      (hMF : regionDisjoint mData MktOff.size fData PflOff.size)
+      (hMO : regionDisjoint mData MktOff.size fOther PflOff.size)
+      (hExec : applyExecSpread mData fData fOther qty execPrice clampSpread s = .ok () s') :
+      SvmAdvStep dData fData realSlot s s'
+  | spreadAdvS (mData fOther : Ptr) (qty execPrice : UInt64) (clampSpread : Bool) (s s' : SvmState)
+      (hsp : 16 ≤ s.stackSp.toNat)
+      (hmV : regionValid mData MktOff.size) (hoV : regionValid fOther PflOff.size) (hfV : regionValid fData PflOff.size)
+      (hmSt : s.stackSp ≤ mData) (hoSt : s.stackSp ≤ fOther) (hfSt : s.stackSp ≤ fData)
+      (hOF : regionDisjoint fOther PflOff.size fData PflOff.size)
+      (hMO : regionDisjoint mData MktOff.size fOther PflOff.size)
+      (hMF : regionDisjoint mData MktOff.size fData PflOff.size)
+      (hExec : applyExecSpread mData fOther fData qty execPrice clampSpread s = .ok () s') :
+      SvmAdvStep dData fData realSlot s s'
 
 /-- Reflexive-transitive closure of arbitrary adversarial-market bytecode steps on `SvmState.mem`. -/
 inductive SvmAdvTrace (dData fData : Ptr) (realSlot : UInt64) : SvmState → SvmState → Prop where
@@ -141,6 +159,14 @@ theorem svm_to_firewall_multi_market_isolation
       have e0 := hByte 0 (by decide); rw [p0] at e0
       simp only [p41, p42, p43, e0, hByte 1 (by decide), hByte 2 (by decide), hByte 3 (by decide),
         hByte 4 (by decide), hByte 5 (by decide), hByte 6 (by decide), hByte 7 (by decide)]
+    | spreadAdvL mData fOther qty execPrice clampSpread _ _ hsp hmV hfV hoV hmSt hfSt hoSt hFO hMF hMO hExec =>
+      have ⟨_, _, _, hLock⟩ := applyExecSpread_conserves_capital
+        mData fData fOther qty execPrice clampSpread a b hsp hmV hfV hoV hmSt hfSt hoSt hFO hMF hMO hExec
+      exact (hLock realSlot hRealLt).1
+    | spreadAdvS mData fOther qty execPrice clampSpread _ _ hsp hmV hoV hfV hmSt hoSt hfSt hOF hMO hMF hExec =>
+      have ⟨_, _, _, hLock⟩ := applyExecSpread_conserves_capital
+        mData fOther fData qty execPrice clampSpread a b hsp hmV hoV hfV hmSt hoSt hfSt hOF hMO hMF hExec
+      exact (hLock realSlot hRealLt).2
   have hTraceEq : ∀ {a b : SvmState}, SvmAdvTrace dData fData realSlot a b →
       b.readU64 (legPtrAt fData realSlot + LegOff.lockedMm) =
       a.readU64 (legPtrAt fData realSlot + LegOff.lockedMm) := by

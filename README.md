@@ -10,20 +10,20 @@ It achieves **full cross-margin capital efficiency on healthy markets** (hedged 
 
 The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/Program.lean)) plus **5 formally verified composable external programs** that integrate via CPI without bloating or modifying the core ABI:
 - **[`Percolator.Matcher`](Percolator/Matcher.lean)** (`6,200 B`) — zero-signer-delegation CPI-Out PropAMM supporting single- and multi-market batch fills (`k ∈ [1..8]`) with market allowlist pinning, spread + inventory-impact quoting, and 0 custody.
-- **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (`13,592 B`) — **zero-ABI-change Hyperliquid-parity personal orderbook** (`864 B` `LimitBookCtx`, 8 independent order slots across any markets) bound via `SetPortfolioMatcher` + `TradeWithMatcher` with `Sysvar1nstructions` caller auth (`LErr.wrongCaller = 302`). Supports all 13 HL modes: multi-order ladders, GTC, GTD expiry, ALO Post-Only, FOK, Reduce-Only, Price Improvement, Stop-Loss Market/Limit, Take-Profit Market/Limit, Trailing Stop (+ permissionless `Op 5 CrankTrailing`), TWAP Slicer, atomic linked OCO (`ocoLink ∈ 0..7`), Multi-Market Batch Fills (`k ∈ [1..8]`), limit-guarded wide real-price outage closes, and 1-tx crossing-order flash-arb clearing (`15,123 CU`, 0 maker sigs).
-- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`19,224 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode**, with pinned feed owners/IDs, confidence & staleness checks, instant 1-slot snap when `OI == 0`, smooth multi-slot auto-clamped convergence (in lockstep with core `dt == 1` half-step pacing), and on-chain premium funding.
+- **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (`14,064 B`) — **zero-ABI-change Hyperliquid-parity personal orderbook** (`896 B` `LimitBookCtx` pinning `dex` + `percolatorProg`, 8 independent order slots across any markets) bound via `SetPortfolioMatcher` + `TradeWithMatcher` with `Sysvar1nstructions` caller auth (`LErr.wrongCaller = 302`) and wrap-free TWAP intervals. Supports all 13 HL modes: multi-order ladders, GTC, GTD expiry, ALO Post-Only, FOK, Reduce-Only, Price Improvement, Stop-Loss Market/Limit, Take-Profit Market/Limit, Trailing Stop (+ permissionless DEX-pinned `Op 5 CrankTrailing`), TWAP Slicer, atomic linked OCO (`ocoLink ∈ 0..7`), Multi-Market Batch Fills (`k ∈ [1..8]`), limit-guarded wide real-price outage closes, and 1-tx crossing-order flash-arb clearing (`15,246 CU`, 0 maker sigs).
+- **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (`19,352 B`) — permissionless on-chain oracle bridge natively parsing **Pyth Pull (`PriceUpdateV2`)**, **Chainlink OCR2 (`Transmissions`)**, **Switchboard On-Demand (`PullFeedAccountData`, 128-bit `PRECISION=18`)**, custom feeds, **2-leg composite ratios** (`base / quote`, e.g. `STOXX/SOL`), and **EWMA smoothing + Hybrid After-Hours mode**, with pinned feed owners/IDs, confidence & staleness checks, instant 1-slot snap when `OI == 0`, smooth multi-slot auto-clamped convergence (in lockstep with core `dt == 1` half-step pacing), and on-chain premium funding.
 - **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (`17,384 B`) — permissionless LP share vault owning a PDA `Portfolio` for zero-ADL liquidation takeovers (`Liquidate mode=1`) and allowlist-pinned PropAMM market-making with anti-ERC-4626-inflation first-deposit locking and NAV non-dilution proofs.
 - **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (`20,584 B`) — permissionless per-market Gavel $xy=k$ uniform-price batch buy-and-burn module supporting SPL Token, Token-2022, and wSOL with strict 5th-bucket (`F_tot`) isolation and anti-rate-collapse reserve-rate floor (`MIN_RATE_E6 = 1_000`).
 
 | Program | ELF `.so` Size (sBPF v3) | sBPF Insns | Stack | Heap | Formal Lean 4 Proofs (`0 sorry`, `0` custom axioms) |
 |---|---:|---:|---:|---:|---|
-| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,512 B** | 11,647 | 784 B | 0 B | **239 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs` |
+| **[`Percolator.Program`](Percolator/Program.lean)** (Core DEX) | **93,952 B** | 11,702 | 784 B | 0 B | **247 public theorems** across `Spec`/`Proofs`/`TraceProofs`/`ThreatModel`/`Refinement`/`AbiProofs`/`HandlerProofs`/`LivenessProofs`/`ExternalProofs`/`Layout` |
 | **[`Percolator.Matcher`](Percolator/Matcher.lean)** (CPI-Out PropAMM) | **6,200 B** | 733 | 64 B | 0 B | **7 theorems** (layout, ask/bid bounds, `maxMove` clamp, LP-favorable spread) |
-| **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (HL Orderbook) | **13,592 B** | 1,657 | 304 B | 0 B | **7 theorems** (`limit_book_layout_valid`, `limit_fill_conserves_remaining`, `oco_sync_cancels_partner`, `twap_slice_bounded`, `alo_post_only_passive`, `stop_and_tp_trigger_sound`, `trailing_watermark_monotone`) |
-| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Oracle Bridge) | **19,224 B** | 2,361 | 552 B | 0 B | **8 theorems** (clamp + funding bounds, OCR2 ring-buffer, E6 scaling, 2-leg ratio, EWMA bounds/fixed-point/refinement) |
-| **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (HLP Takeover Vault) | **17,384 B** | 2,131 | 864 B | 0 B | **7 theorems** (layout, anti-inflation lock, NAV non-dilution, withdrawal solvency, allowlist subset anti-rug) |
-| **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (Buy & Burn) | **20,584 B** | 2,531 | 704 B | 0 B | **11 theorems** (layout, $xy=k$ invariant, batch solvency, quiet-epoch cap, spam monotonicity, anti-collapse healthy/dust/empty rate proofs, exact fee-split conservation) |
-| *Total* | *6 production ELFs* | — | — | **0 B** | **279 public theorems** (328 incl. private lemmas), `0 sorry`, `0` custom axioms |
+| **[`Percolator.LimitMatcher`](Percolator/LimitMatcher.lean)** (HL Orderbook) | **14,064 B** | 1,716 | 304 B | 0 B | **8 theorems** (`limit_book_layout_valid`, `limit_fill_conserves_remaining`, `oco_sync_cancels_partner`, `twap_slice_bounded`, `twapReadyU64_iff_exact_nat`, `alo_post_only_passive`, `stop_and_tp_trigger_sound`, `trailing_watermark_monotone`) |
+| **[`Percolator.OracleAdapter`](Percolator/OracleAdapter.lean)** (Oracle Bridge) | **19,352 B** | 2,377 | 552 B | 0 B | **8 theorems** (clamp + funding bounds, OCR2 ring-buffer, E6 scaling, 2-leg ratio, EWMA bounds/fixed-point/refinement) |
+| **[`Percolator.HlpVault`](Percolator/HlpVault.lean)** (HLP Takeover Vault) | **17,384 B** | 2,131 | 864 B | 0 B | **6 public theorems** (7 incl. private; layout, anti-inflation lock, NAV non-dilution, withdrawal solvency, allowlist subset anti-rug) |
+| **[`Percolator.RewardModule`](Percolator/RewardModule.lean)** (Buy & Burn) | **20,584 B** | 2,531 | 704 B | 0 B | **11 public theorems** (12 incl. private; layout, $xy=k$ invariant, batch solvency, quiet-epoch cap, spam monotonicity, anti-collapse healthy/dust/empty rate proofs, exact fee-split conservation) |
+| *Total* | *6 production ELFs* | — | — | **0 B** | **287 public theorems** (337 incl. private lemmas), `0 sorry`, `0` custom axioms |
 
 ---
 
@@ -31,15 +31,15 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 
 ```
 ┌──────────────────────────────────┐  ┌──────────────────────────────────┐
-│ Percolator.Matcher (6,200 B)     │  │ Percolator.LimitMatcher (13.5KB) │
+│ Percolator.Matcher (6,200 B)     │  │ Percolator.LimitMatcher (14.1KB) │
 │ • CPI-Out PropAMM (k=1..8 batch) │  │ • 8-Slot HL Personal Orderbook   │
 │ • Zero Signer Delegation         │  │ • All 13 HL Modes + OCO + TWAP   │
-│ • Allowlist-Pinned Markets       │  │ • Sysvar1nstructions Caller Auth │
+│ • Allowlist-Pinned Markets       │  │ • DEX-Pinned + Sysvar1nst Auth   │
 └────────────────┬─────────────────┘  └────────────────┬─────────────────┘
                  └──────────┐  CPI-Out (`MRET`) ┌──────┘
                             ▼  TradeWithMatcher ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│           percolator-lean Core (93,512 B · 24 ops · sBPF v3 · 0 heap)  │
+│           percolator-lean Core (93,952 B · 24 ops · sBPF v3 · 0 heap)  │
 │ • Realizable 8-Leg Cross-Margin     • Per-Leg `lockedMm` Firewall      │
 │ • 5-Bucket Exact C+I+R+S+F = V      • I_m-Contained Cross-PnL Fronting │
 │ • Mode-4 Atomic Netting / Flip      • K+1=5 Compounded Oracle Envelope │
@@ -47,8 +47,8 @@ The repository ships a minimal core clearinghouse ([`percolator.so`](Percolator/
 └──────────────────▲──────────────────────────▲──────────────────────────┘
                    │ CPI                      │ CPI
 ┌──────────────────┴───────────────┐  ┌───────┴──────────────────────────┐
-│ Percolator.OracleAdapter (18.9KB)│  │ Percolator.HlpVault (17.4KB) &   │
-│ • Pyth V2 / Chainlink / SB 128b  │  │ Percolator.RewardModule (20.5KB) │
+│ Percolator.OracleAdapter (19.4KB)│  │ Percolator.HlpVault (17.4KB) &   │
+│ • Pyth V2 / Chainlink / SB 128b  │  │ Percolator.RewardModule (20.6KB) │
 │ • 2-Leg Ratios + EWMA / AfterHrs │  │ • PDA Takeover + xy=k Buy&Burn   │
 └──────────────────────────────────┘  └──────────────────────────────────┘
 ```
@@ -79,7 +79,7 @@ $$\text{availCap}(j) = \text{capital} + \text{leg}_j.\text{lockedMm}$$
 Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **never** touched or raided by market $j$:
 - **Strict Permissionless Non-Contagion:** Even a god-mode attacker who creates a malicious market `M_atk`, pumps it +25%–+1000%, and drains shared `freeCapital -> 0` and `M_atk.lockedMm -> 0` leaves `BTC.lockedMm` **bit-for-bit intact** (`svm_to_firewall_multi_market_isolation`, `threat_multi_market_permissionless_firewall_non_contagion`), guaranteeing `shortfall = 0` and `0` draw on `I_BTC`.
 - **Full HL-UX Capital Efficiency:** Free excess capital above `totalLockedMm` (plus instant realized profits) flows 1:1 across all 8 legs, letting hedged cross-margin portfolios survive deep parallel moves (`Suite 16E` -20% survival & 3rd-leg cross reuse) without liquidation.
-- **Overflow-Immune Settlement & `MAX_MKT_NOTIONAL` Cap:** Both `CreateMarket` and `UpdateOracle` enforce `max(oiL, oiS) * markPrice / POS_SCALE <= MAX_MKT_NOTIONAL` (`10^17` = `$100B` at E6), and `settleAndRefreshLeg` uses saturating 128-bit arithmetic (`mulDiv64Sat`, `mulDiv64CeilSat`, `creditSatGain`) so adversarial self-made markets can never trigger `ArithmeticOverflow` DoS (`#110`).
+- **Overflow-Immune Settlement & `MAX_MKT_NOTIONAL` Cap:** `CreateMarket`, `UpdateOracle`, AND `Trade(mode=0)` all enforce `max(oiL, oiS) * markPrice / POS_SCALE <= MAX_MKT_NOTIONAL` (`10^17` = `$100B` at E6 — closing the post-`OI==0`-snap notional bypass), and `settleAndRefreshLeg` uses saturating 128-bit arithmetic (`mulDiv64Sat`, `mulDiv64CeilSat`, `creditSatGain`) so adversarial self-made markets can never trigger `ArithmeticOverflow` DoS (`#110`).
 
 ### 2.3 Bankrupt Settlement Containment, All-Leg Freshness & Post-Fee Partial-Liq Solvency
 
@@ -109,7 +109,7 @@ Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **ne
 | **`Market`** | `MKTP` | 400 B | `status`, `maxFrontBps`, `marketId`, `dex`, `oracleAuth`, `marketAdmin`, `markPrice`, `lastOracleSlot`, `windDownSlot`, immutable risk params (`imBps`, `mmBps`, `liqFeeBps`, `tradeFeeBps`, `maxMoveBps`, `maxInsDrawBps`, `maxOi`, `exitWindow`, `maxStaleness`, `minMm`, `rewardBps`, `rewardRecipient`), `realizedPool`, `insurance`, `insFronted`, `totalPosPnl`, `totalInsShares`, `oiLong/Short`, `rawBasisLong/Short`, `adlLong/Short`, `kLong/Short`, `resolvedNum/Den`, `activeLegs`, `rewardAccrued` |
 | **`Portfolio`** | `PFLO` | 976 B | 144 B header (`legCount`, `portfolioId`, `totalLockedMm`, `dex`, `owner`, `capital`, `totalMm`, `totalIm`, `matcherCtx`) + **8 × 104 B `Leg` slots** (incl. per-leg `lockedMm`) |
 | **`InsReceipt`** | `INSR` | 88 B | `marketId`, `owner`, `market`, `shares` |
-| **`LimitBookCtx`** | `MRET` | 864 B | 144 B standard `MatcherReturn` (16 B header + 8 × 16 B quotes) + `owner` + `percolatorProg` + `paused` + **8 × 80 B `OrderSlot`** |
+| **`LimitBookCtx`** | `MRET` | 896 B | 144 B standard `MatcherReturn` (16 B header + 8 × 16 B quotes) + `owner` + `percolatorProg` + `dex` + `paused` + **8 × 80 B `OrderSlot`** |
 
 ---
 
@@ -162,7 +162,7 @@ Other legs' `lockedMm` (`otherLocked = totalLockedMm - leg_j.lockedMm`) are **ne
 
 ## 6. Verification & Benchmarks (LiteSVM `0.18.2` / Agave `4.3.2`, sBPF v3)
 
-See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **279 public Lean 4 theorems** (`0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **26 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
+See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **287 public Lean 4 theorems** (`337` incl. private lemmas, `0 sorry`, `0` custom axioms). All **17 end-to-end LiteSVM suites** in [`svm-runner/src/main.rs`](svm-runner/src/main.rs) + **26 standalone tests** in [`svm-runner/src/boring_tests.rs`](svm-runner/src/boring_tests.rs) pass 100% on strict sBPF v3 ELFs (`e_flags = 3`, 0 relocations, 0 heap):
 
 ### Worst-Case 8-Leg / 16-Leg CU & Legacy Wire-MTU Benchmarks (Suite 11)
 
@@ -215,7 +215,7 @@ See [`INVARIANTS.md`](INVARIANTS.md) for the full catalog of **279 public Lean 4
 ## 7. Build & Reproduce
 
 ```bash
-# Run full Lean 4 kernel proof verification (279 public theorems, 0 sorry, 0 custom axioms),
+# Run full Lean 4 kernel proof verification (287 public theorems, 0 sorry, 0 custom axioms),
 # compile all 7 sBPF v3 .so binaries, and execute all 17 LiteSVM suites:
 ./scripts/build-and-test.sh
 
